@@ -773,7 +773,11 @@ function watchRecovery(s) {
   if (!s.cluster || s.telemetry.sql !== 'ok') return;
   const op = s.operation;
   if (op && op.status === 'running' && PROVISIONING.has(op.kind)) { disturbedSince = null; return; }
-  const disturbed = s.nodes.some((n) => DISTURBED.has(nodeLook(n)[0])) || s.regions.some((r) => r.state === 'down');
+  // A node or a region that is being removed on purpose has not failed: its nodes stop a few seconds before it
+  // leaves the picture, and "Fully recovered" over a planned scale-in would tell the audience there was an outage.
+  const look = (n) => nodeLook(n, op)[0];
+  const leaving = (r) => s.nodes.some((n) => n.region === r.name) && s.nodes.every((n) => n.region !== r.name || look(n) === 'draining');
+  const disturbed = s.nodes.some((n) => DISTURBED.has(look(n))) || s.regions.some((r) => r.state === 'down' && !leaving(r));
   if (disturbed) { if (disturbedSince === null) disturbedSince = s.ts; return; }
   const wasFor = disturbedSince === null ? 0 : s.ts - disturbedSince;
   disturbedSince = null;

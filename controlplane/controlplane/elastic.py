@@ -19,6 +19,7 @@ DRAIN_ATTEMPTS = 900  # replicas move at the cluster's pace; 15 minutes is gener
 SQL_ATTEMPTS = 30
 SETTLE_ATTEMPTS = 36  # x 5 s: CockroachDB marks a restarted store "suspect" for a while (30 s by default)
 TRANSIENT_REFUSALS = ("suspect", "throttled")  # decommission pre-check refusals that clear up on their own
+HOME_COPIES = {"zone": 3, "region": 2}  # voters a REGIONAL BY ROW partition keeps in its home region, by survival goal
 
 
 class ElasticError(ValueError):
@@ -36,8 +37,11 @@ class Elastic:
                  run_in_background: Callable[[Callable[[], None]], None] | None = None):
         # Called inside remove_region's operation: before the DROP REGION statements (the Payments workload moves
         # its rows out, since CockroachDB refuses to drop a region that still homes rows) and after the change.
+        # And inside add_region's, once the region is part of the databases (Payments gives it customers). Payments
+        # keeps running through all of them. A hook may return a line for the operation log.
         self.before_region_removal: list = []
         self.after_region_removal: list = []
+        self.after_region_added: list = []
         self._docker = docker
         self._provisioner = provisioner
         self._lb = lb
@@ -79,6 +83,7 @@ class Elastic:
         def work(op):
             self._drain(op, topo, [name])
             self._finish_change(op, without_nodes(topo, {name}))
+            self._release(op, [name])
         self._submit("decommission", work, topo)
 
     def add_region(self, name: str, provider: str, nodes: int = 3, label: str | None = None, location=None) -> None:
@@ -108,6 +113,21 @@ class Elastic:
             self._ops.step(op, f"Adding {region.name} to the multi-region databases")
             self._run_sql(stmts)
             self._finish_change(op, new_topo)
+            # Payments homes customers in the region only if it can hold the copies the survival goal keeps at home
+            # (the rule set_survival enforces for ZONE): otherwise their ranges could never be placed as asked.
+            need = HOME_COPIES.get(topo.survival_goal, 1)
+            if len(added) < need:
+                if self.after_region_added:
+                    self._ops.step(op, f"Payments keeps its customers where they are: {region.name} has {len(added)} "
+                                       f"node{'' if len(added) == 1 else 's'}, and {topo.survival_goal.upper()} survival "
+                                       f"keeps {need} copies of a region's payments at home")
+            else:
+                for hook in self.after_region_added:  # the region is in: whether Payments uses it never changes that
+                    try:
+                        self._note(op, hook(region.name))
+                    except Exception as e:
+                        log.warning("after-add hook failed: %s", e)
+                        self._ops.step(op, f"Note: Payments does not serve {region.name} yet: {e}")
             if topo.survival_goal == "zone" and len(new_topo.regions) >= 3:
                 self._ops.step(op, "The cluster now qualifies for REGION survival")
         self._submit("add-region", work, topo)
@@ -130,7 +150,7 @@ class Elastic:
                 if self.before_region_removal:
                     self._ops.step(op, f"Checking Payments accounts in {name}")
                     for hook in self.before_region_removal:
-                        hook(name)
+                        self._note(op, hook(name))
                 if topo.survival_goal != "none" and (region.secondary or goal != topo.survival_goal):
                     stmts = []
                     if region.secondary:
@@ -150,16 +170,18 @@ class Elastic:
                     still = [db for db in DATABASES
                              if name in {r[0] for r in self._query(f"SELECT region FROM [SHOW REGIONS FROM DATABASE {db}]")}]
                     self._run_sql([f"ALTER DATABASE {db} DROP REGION IF EXISTS {_ident(name)}" for db in still])
-                self._drain(op, topo, [n.name for n in topo.nodes if n.region == name], settling=(f"+region={name}:",))
+                leaving = [n.name for n in topo.nodes if n.region == name]
+                self._drain(op, topo, leaving, settling=(f"+region={name}:",))
                 self._finish_change(op, new_topo)
+                self._release(op, leaving)
             finally:
-                # Whatever happened, Payments may run again; its failure to restart never changes the outcome.
+                # Whatever happened, the removal is over for Payments; a failing hook never changes the outcome.
                 for hook in self.after_region_removal:
                     try:
                         hook(name)
                     except Exception as e:
                         log.warning("after-removal hook failed: %s", e)
-                        self._ops.step(op, f"Note: Payments did not restart on its own: {e}")
+                        self._ops.step(op, f"Note: Payments was not told the removal is over: {e}")
         self._submit("remove-region", work, topo)
 
     def set_survival(self, goal: str) -> None:
@@ -210,6 +232,11 @@ class Elastic:
         self._submit("primary", work, topo)
 
     # -- internals --
+
+    def _note(self, op: Operation, line) -> None:
+        """A hook's line for the operation log, when it has one."""
+        if isinstance(line, str) and line:
+            self._ops.step(op, line)
 
     def _topology(self) -> Topology:
         topo = self._provisioner.topology
@@ -322,8 +349,9 @@ class Elastic:
         raise RuntimeError(f"{region} did not join the cluster")
 
     def _drain(self, op: Operation, topo: Topology, names: list[str], settling: tuple[str, ...] = ()) -> None:
-        """Decommission `names` and wait for their replicas to move. `settling`: refusal texts that mean the cluster is
-        still catching up with a change just made (a dropped region still named by placement rules), worth waiting out."""
+        """Decommission `names` and wait for their replicas to move; _release stops them once the change is committed.
+        `settling`: refusal texts that mean the cluster is still catching up with a change just made (a dropped region
+        still named by placement rules), worth waiting out."""
         rows = self._query("SELECT n.node_id, n.address FROM crdb_internal.gossip_nodes n "
                            "JOIN crdb_internal.gossip_liveness l USING (node_id) WHERE l.membership = 'active'",
                            exclude=names)
@@ -347,6 +375,11 @@ class Elastic:
             else:
                 raise RuntimeError(f"replicas did not drain from {label}; check the DB Console")
             self._decommission(host, topo, ids, "all", settling=settling)
+
+    def _release(self, op: Operation, names: list[str]) -> None:
+        """Stop and remove the containers of nodes that have left the cluster. Last, after the load balancer and the
+        topology have let go of them: stopped while still part of the topology, they looked like a dead node or a
+        region outage on the stage for a few seconds, and the load balancer still listed them."""
         self._ops.step(op, "Releasing capacity")
         if self._chaos is not None:
             self._chaos.forget(names)

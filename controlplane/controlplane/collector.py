@@ -19,6 +19,11 @@ DECOMMISSIONED = 2  # liveness membership: 0 active, 1 decommissioning, 2 decomm
 # nodes are up and serving. A node the panel can vouch for (its container runs, it is on the network, no chaos is
 # applied to it) keeps counting as live until its record is this many seconds past its expiry.
 LIVENESS_GRACE = 8.0
+# A look that failed is not a look that found nothing. While the cluster changes shape the status API can go quiet for
+# seconds, and a node removed between the two calls of a container listing fails the listing. Reporting "no live node"
+# or "no container" then showed an unreachable cluster on the stage and left Payments workers with nowhere to connect.
+# What was last seen stands for this many seconds instead.
+OBSERVATION_GRACE = 15.0
 
 
 def _fetch_json(host: str, path: str) -> dict:
@@ -69,6 +74,8 @@ class Collector:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._latest = assemble_snapshot(None, [], None, None, None, clock())
+        self._listed: tuple[float, list] | None = None  # when the containers were last listed, and the listing
+        self._answered: tuple[float, list, dict] | None = None  # when the status API last answered, and what it said
 
     def latest(self) -> dict:
         with self._lock:
@@ -78,13 +85,22 @@ class Collector:
         topo = self._provisioner.topology
         try:
             containers = self._docker.list_nodes()
+            self._listed = (self._clock(), containers)
         except DockerError:
-            containers = []
+            fresh = self._listed and self._clock() - self._listed[0] < OBSERVATION_GRACE
+            containers = self._listed[1] if fresh else []
         flags = self._chaos.flags() if self._chaos else None
         sql_nodes, ranges = (None, None)
         if topo is not None:
             hosts = [self._status_host] + [n.ip for n in topo.nodes]
-            sql_nodes, ranges = self._query(hosts, self._vouched(topo, containers, flags))
+            vouched = self._vouched(topo, containers, flags)
+            sql_nodes, ranges = self._query(hosts, vouched)
+            if sql_nodes is not None:
+                self._answered = (self._clock(), sql_nodes, ranges)
+            elif self._answered and self._clock() - self._answered[0] < OBSERVATION_GRACE:
+                # Nobody answered. The last answer stands, but only for the nodes the panel itself knows are up.
+                _, rows, ranges = self._answered
+                sql_nodes = [dict(r, is_live=r["is_live"] and str(r["address"]).rsplit(":", 1)[0] in vouched) for r in rows]
         latency = self._chaos.latency_setting() if (self._chaos and topo) else None
         snap = assemble_snapshot(topo, containers, sql_nodes, ranges, self._ops.snapshot(), self._clock(),
                                  network=self._network, flags=flags, latency=latency)

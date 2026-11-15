@@ -141,6 +141,72 @@ def sql(query: str, *, db: str = "defaultdb", one=False):
         return cur.fetchone() if one else cur.fetchall()
 
 
+def payments_through_region_changes(ev: dict, region: str = "ap-northeast-1") -> None:
+    """A region joins and leaves while Payments runs. It takes its share of the customers and hands them back, the
+    database ends as it began, and every second in between sees payments commit."""
+    seconds: dict[int, int] = {}  # commits in every complete second, from the workload's own history
+    done = threading.Event()
+
+    def watch():
+        while not done.wait(2.0):
+            try:
+                for h in state()["workload"]["history"]:
+                    seconds[h["ts"]] = h["commits"]
+            except Exception:
+                pass  # the next look covers it: the history holds two minutes
+
+    def homed() -> dict:
+        return {str(r): int(c) for r, c in sql("SELECT crdb_region, count(*) FROM accounts GROUP BY 1", db="chaos")}
+
+    check(api("POST", "/api/workload/start")[0] == 200, "payments refused to start")
+    try:
+        before = wait_for(lambda: (lambda w: w if w["tps"] > 100 and w["balance"] == 10_000_000 else None)(state()["workload"]),
+                          180, "payments to run and the invariant to be checked")
+        layout = homed()
+        time.sleep(10)
+        start = max((h["ts"] for h in state()["workload"]["history"]), default=0)
+        threading.Thread(target=watch, daemon=True).start()
+
+        previous = op_id()
+        check(api("POST", "/api/cluster/regions", {"name": region, "provider": "aws", "nodes": 3})[0] == 202, "add region refused")
+        op = wait_op(previous)
+        check(op["status"] == "done", f"add region failed: {op.get('error')}")
+        ev["what payments did when it joined"] = next((s for s in op["steps"] if s.startswith("Payments")), None)
+        w = state()["workload"]
+        check(region in w["homing"]["regions"] and w["running"], "payments do not serve the new region")
+        share = homed().get(region, 0)
+        ev["accounts homed in the new region"] = share
+        check(share == 10_000 // len(w["homing"]["regions"]), f"the new region homes {share} accounts, not its share")
+        serving = wait_for(lambda: (lambda h: h if h and h["tps"] >= 20 else None)(state()["workload"]["by_home"].get(region)),
+                           420, "the new region to take payments of its own")
+        ev["the new region's own payments"] = f"{serving['tps']}/s at p50 {serving['p50_ms']} ms"
+
+        previous = op_id()
+        check(api("DELETE", f"/api/cluster/regions/{region}")[0] == 202, "remove region refused")
+        op = wait_op(previous, timeout=2400)
+        check(op["status"] == "done", f"remove region failed: {op.get('error')}")
+        ev["what payments did before it left"] = next((s for s in op["steps"] if "Payments accounts moved" in s), None)
+        check(ev["what payments did before it left"] and "while Payments kept running" in ev["what payments did before it left"],
+              "the operation does not say that payments kept running")
+        healthy()
+        time.sleep(6)
+        after = state()["workload"]
+        ev["accounts by region afterwards"] = homed()
+        check(ev["accounts by region afterwards"] == layout, f"accounts are not homed as before: {ev['accounts by region afterwards']}")
+        check(after["running"] and region not in after["homing"]["regions"], "payments stopped, or still serve the removed region")
+        watched = [commits for ts, commits in sorted(seconds.items()) if ts > start]
+        ev.update({"seconds watched": len(watched), "slowest second": f"{min(watched, default=0)} payments",
+                   "seconds without a payment": sum(c == 0 for c in watched),
+                   "failed transfers": after["failed_total"] - before["failed_total"], "money lost": after["money_lost"]})
+        check(len(watched) > 120, "the per-second history has gaps")
+        check(min(watched) > 0, f"{sum(c == 0 for c in watched)} seconds passed without a payment")
+        check(after["failed_total"] == before["failed_total"], "transfers failed")
+        check(after["money_lost"] == 0 and after["balance"] == 10_000_000, "the invariant broke")
+    finally:
+        done.set()
+        api("POST", "/api/workload/stop")
+
+
 def tc(name: str) -> str:
     return sh(CLI, "run", "--rm", "--network", f"container:{name}", "--entrypoint", "tc", HELPER, "qdisc", "show", "dev", "eth0")
 
@@ -706,6 +772,8 @@ def main() -> int:
         ev["regions after remove"] = [r["name"] for r in healthy()["regions"]]
         check("ap-northeast-1" not in ev["regions after remove"], "region still there")
     p.run("Add a region to both databases, then remove it", regions)
+    p.run("A region joins and leaves while Payments runs: it takes customers, gives them back, and no second passes "
+          "without a payment", payments_through_region_changes, long=True)
 
     # ---- scenarios ----
     p.section = "Guided scenarios"

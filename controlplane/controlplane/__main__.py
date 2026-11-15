@@ -60,8 +60,9 @@ def main() -> None:
     workload = Workload(partial(connect, dbname="chaos", timeout=3, statement_timeout="5s"),
                         host=settings.haproxy_container, events=events)
     chaos.on_disrupt.append(workload.mark_failure)
+    elastic.after_region_added.append(workload.expand)
     elastic.before_region_removal.append(workload.evacuate)
-    elastic.after_region_removal.append(workload.resume)
+    elastic.after_region_removal.append(workload.removal_done)
     metrics = Metrics()
     cdc = CdcSink()
     try:

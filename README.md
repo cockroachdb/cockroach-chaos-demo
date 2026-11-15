@@ -224,6 +224,16 @@ single write from the home gateway measured 63 ms in us-east-1 and us-west-2 and
 transfers. A cluster whose `chaos` database is not multi-region (survival goal none, as on the `small` preset)
 keeps plain tables through the load balancer.
 
+The regions can change while Payments runs, and it keeps running. When a region joins the databases, Payments
+gives it its share of the customers: accounts move there from the other regions, the workers are dealt over all the
+regions again, and once the new region's ranges hold replicas of their own its leases come home and its payments
+are as local as everyone else's (a minute or two). Before a region leaves, its accounts are spread over the regions
+that stay and its workers follow them, because CockroachDB refuses `DROP REGION` while a row is homed there. Neither
+direction stops anything: the accounts that are about to move are taken out of the workers' reach for a moment, the
+transfers already on their way to them finish, and the rows change region in one transaction that no payment can
+meet. A new region gets customers only if it has the nodes to keep their copies at home: three under ZONE survival,
+two under REGION.
+
 Retries follow CockroachDB best practice (`controlplane/controlplane/retry.py`, matching cockroachdb-jdbc-wrapper,
 langchain-cockroachdb and Banko): `40001` serialization failures, `40003` ambiguous results, `08xxx` connection
 errors, `57P01` admin shutdown and statement timeouts, plus the usual message patterns for errors without a code,

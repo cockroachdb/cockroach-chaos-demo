@@ -35,7 +35,9 @@ want a cloud-looking address in the browser bar, add a hosts-file entry such as
    under REGION every region keeps flowing. Cross-region transfers pause for the ZONE half (one to a customer in the
    lost region would wait for that region too) and come back with REGION survival.
 3. **REGIONAL BY ROW**: the latency heatmap. The diagonal is local (about 1 ms); everything else pays the round trip.
-4. **Elastic scale**: add a node live, then decommission it and watch replicas drain first.
+4. **Elastic scale**: add a node and a whole region live, then take them away. Watch the chart: the new region gets
+   its own band as it takes a share of the payments, and hands its customers back before it is retired. Payments keep
+   running through all four steps.
 5. Close on the Continuum explainer (`/explainer/continuum`, when your install includes it) if the audience is executive.
 
 ## 30 minutes: the full tour

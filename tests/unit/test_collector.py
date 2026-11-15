@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from controlplane.collector import Collector, parse_status
-from controlplane.docker_ops import ContainerInfo
+from controlplane.docker_ops import ContainerInfo, DockerError
 from controlplane.operations import Operations
 from controlplane.topology import NodeSpec, RegionSpec, Topology
 
@@ -145,3 +145,63 @@ def test_a_partitioned_or_isolated_node_is_down_as_soon_as_its_record_lapses():
     snap = Collector(Detached(), SimpleNamespace(topology=PAIR), Operations(), status_host="haproxy", fetch_json=fetch,
                      clock=lambda: NOW, network="crdb-chaos", chaos=chaos).refresh()
     assert [n["liveness"] for n in snap["nodes"]] == ["dead", "dead"]
+
+
+# -- a look that failed is not a look that found nothing --
+
+def watcher(docker=None, answers=None):
+    """A collector on TOPO whose clock and status answers a test controls: answers["ok"] False = nobody answers."""
+    clock, answers = {"now": NOW}, answers if answers is not None else {"ok": True}
+
+    def fetch(host, path):
+        if not answers["ok"]:
+            raise OSError("timed out")
+        return NODES if path == "/_status/nodes" else LIVENESS
+    c = Collector(docker or Docker(), SimpleNamespace(topology=TOPO), Operations(), status_host="haproxy", fetch_json=fetch,
+                  clock=lambda: clock["now"])
+    return c, clock, answers
+
+
+class FlakyDocker(Docker):
+    """fail: the listing raises, as it does when a node is removed between its two calls. running: the node's state."""
+    fail, running = False, True
+
+    def list_nodes(self):
+        if self.fail:
+            raise DockerError("no such container: ap-northeast-1a-n1")
+        return [ContainerInfo(NODE.name, "1", self.running, "running" if self.running else "exited", {}, {})]
+
+
+def test_a_container_listing_that_fails_says_nothing_about_the_containers():
+    """Seen while a region was removed under load: the listing failed once, every node looked gone for a moment, and
+    Payments workers that had to reconnect found no node to connect to."""
+    docker = FlakyDocker()
+    c, clock, _ = watcher(docker)
+    assert c.refresh()["nodes"][0]["runtime"] == "running"
+    docker.fail, clock["now"] = True, NOW + 1.5
+    node = c.refresh()["nodes"][0]
+    assert node["runtime"] == "running" and node["liveness"] == "live"
+    clock["now"] = NOW + 60  # still failing a minute later: now nothing is known about the containers
+    assert c.refresh()["nodes"][0]["runtime"] == "missing"
+
+
+def test_a_status_query_nobody_answers_says_nothing_about_the_nodes():
+    """Seen while a region joined under load: no node answered the status query for eight seconds, the stage showed an
+    unreachable cluster with no live node, and Payments counted 154 connection errors."""
+    c, clock, answers = watcher()
+    assert c.refresh()["cluster"]["status"] == "healthy"
+    answers["ok"], clock["now"] = False, NOW + 1.5
+    snap = c.refresh()
+    assert snap["nodes"][0]["liveness"] == "live" and snap["cluster"]["status"] == "healthy" and snap["cluster"]["live_nodes"] == 1
+    assert snap["ranges"] == {"unavailable": 0, "underreplicated": 2}  # the last answer's, with the nodes
+    clock["now"] = NOW + 60  # nobody has answered for a minute: the cluster is unreachable
+    snap = c.refresh()
+    assert snap["cluster"]["status"] == "unreachable" and snap["nodes"][0]["liveness"] == "unknown"
+
+
+def test_an_old_answer_never_keeps_a_node_live_that_the_panel_cannot_vouch_for():
+    docker = FlakyDocker()
+    c, clock, answers = watcher(docker)
+    c.refresh()
+    docker.running, answers["ok"], clock["now"] = False, False, NOW + 1.5  # the node was just crashed; nobody answers
+    assert c.refresh()["nodes"][0]["liveness"] == "dead"

@@ -701,26 +701,46 @@ def _add_node(ctx: Context, state: dict) -> dict:
     return {"New node": state["added_node"], "Watch": "replicas and leases flow onto it"}
 
 
+def _payments_home(ctx: Context) -> tuple[bool, list[str]]:
+    """Whether Payments is running, and the regions it homes customers in."""
+    status = ctx.workload.status() if ctx.workload else {}
+    return bool(status.get("running")), list((status.get("homing") or {}).get("regions") or [])
+
+
 def _add_region(ctx: Context, state: dict) -> dict:
     ctx.elastic.add_region(state["new_region"], state["provider"], 3)
     ctx.sleep(0.5)
     ctx.wait_operation()
-    return {"New region": state["new_region"], "Nodes": 3}
+    out = {"New region": state["new_region"], "Nodes": 3}
+    running, homes = _payments_home(ctx)
+    if running and state["new_region"] in homes:  # Payments gave the region its share of customers, without stopping
+        out["Payments"] = "now serve customers there"
+    return out
+
+
+# Replicas leave a node at the cluster's pace, and slower while Payments keeps running: a three-node region took 866 s
+# in a trial. The operation itself is patient (elastic.DRAIN_ATTEMPTS, twice); the step waits as long.
+DRAIN_WAIT = 2400
 
 
 def _decommission(ctx: Context, state: dict) -> dict:
     started = ctx.clock()
     ctx.elastic.decommission(state["added_node"])
     ctx.sleep(0.5)
-    ctx.wait_operation()
+    ctx.wait_operation(DRAIN_WAIT)
     return {"Drained": state["added_node"], "Took": f"{ctx.clock() - started:.0f} s"}
 
 
 def _remove_region(ctx: Context, state: dict) -> dict:
+    was_running, homes_before = _payments_home(ctx)
     ctx.elastic.remove_region(state["new_region"])
     ctx.sleep(0.5)
-    ctx.wait_operation()
-    return {"Removed": state["new_region"]}
+    ctx.wait_operation(DRAIN_WAIT)
+    out = {"Removed": state["new_region"]}
+    running, homes = _payments_home(ctx)
+    if was_running and running and state["new_region"] in homes_before and state["new_region"] not in homes:
+        out["Payments"] = "kept running: its customers moved first"
+    return out
 
 
 ELASTIC = Scenario(

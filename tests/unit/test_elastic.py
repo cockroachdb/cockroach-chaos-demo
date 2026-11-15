@@ -179,6 +179,44 @@ def test_decommission_drains_then_removes_and_reroutes(tmp_path):
     assert any("replicas" in s.lower() for s in op["steps"])
 
 
+def order_of_leaving(docker, prov, lb):
+    """Record, in order, when nodes leave the load balancer and the topology and when their containers stop."""
+    seen = []
+    apply, commit, stop = lb.apply, prov.commit, docker.stop
+    lb.apply = lambda nodes: (seen.append(("balancer", len(nodes))), apply(nodes))[1]
+    prov.commit = lambda topo: (seen.append(("topology", len(topo.nodes))), commit(topo))[1]
+    docker.stop = lambda name, grace=20: (seen.append(("stop", name)), stop(name, grace))[1]
+    return seen
+
+
+def test_a_node_leaves_the_balancer_and_the_picture_before_its_container_stops(tmp_path):
+    """Stopping it first left a few seconds in which the node was still part of the topology but not running: the
+    stage showed a planned scale-in as a dead node, and the load balancer still listed it."""
+    e, docker, db, prov, lb, chaos, ops = make(tmp_path)
+    seen = order_of_leaving(docker, prov, lb)
+    e.decommission("us-west-2b-n2")
+    assert ops.snapshot()["status"] == "done", ops.snapshot()
+    left = len(CLASSIC.nodes) - 1
+    assert seen == [("balancer", left), ("topology", left), ("stop", "us-west-2b-n2")]
+    assert ops.snapshot()["steps"][-2:] == ["Updating the global load balancer", "Releasing capacity"]
+
+
+def test_a_region_leaves_the_balancer_and_the_picture_before_its_containers_stop(tmp_path):
+    """Seen on the stage at the end of a region removal: a red 'region outage' banner for two seconds, with a button
+    to recover the region that had just been retired on purpose."""
+    e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=AWS9)
+    db.regions = [r.name for r in AWS9.regions] + ["ap-northeast-1"]
+    e.add_region("ap-northeast-1", "aws", 3)
+    assert ops.snapshot()["status"] == "done", ops.snapshot()
+    db.all_nodes = list(prov.topology.nodes)
+    seen = order_of_leaving(docker, prov, lb)
+    e.remove_region("ap-northeast-1")
+    assert ops.snapshot()["status"] == "done", ops.snapshot()
+    stops = [i for i, (what, _) in enumerate(seen) if what == "stop"]
+    gone = seen.index(("topology", 9))
+    assert len(stops) == 3 and seen.index(("balancer", 9)) < gone < min(stops)
+
+
 def test_decommission_refuses_the_last_node_of_a_region(tmp_path):
     e, *_ = make(tmp_path)
     with pytest.raises(ElasticError, match="last node"):
@@ -371,28 +409,94 @@ def test_decommission_still_fails_fast_on_a_real_refusal(tmp_path):
     assert len([c for _, c in docker.execs if "decommission" in c]) == 1  # no pointless retries
 
 
-def test_remove_region_evacuates_before_dropping_and_resumes_after(tmp_path):
+def test_a_region_that_joined_is_offered_to_payments_and_what_they_did_is_logged(tmp_path):
+    e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=AWS9)
+    db.regions = [r.name for r in AWS9.regions] + ["ap-northeast-1"]
+    seen = []
+
+    def payments(name):
+        seen.append((name, len(prov.topology.regions), any("ADD REGION" in s for s in db.sql)))
+        return "Payments now serves ap-northeast-1: 2,500 accounts are homed there"
+    e.after_region_added.append(payments)
+    e.add_region("ap-northeast-1", "aws", 3)
+    op = ops.snapshot()
+    assert op["status"] == "done", op
+    assert seen == [("ap-northeast-1", 4, True)]  # once the region is in the databases and in the topology
+    assert "Payments now serves ap-northeast-1: 2,500 accounts are homed there" in op["steps"]
+
+
+def test_payments_that_cannot_use_a_new_region_never_fail_the_change(tmp_path):
+    e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=AWS9)
+    db.regions = [r.name for r in AWS9.regions] + ["ap-northeast-1"]
+    e.after_region_added.append(lambda name: (_ for _ in ()).throw(RuntimeError("no node took the accounts")))
+    e.add_region("ap-northeast-1", "aws", 3)
+    op = ops.snapshot()
+    assert op["status"] == "done" and len(prov.topology.regions) == 4
+    assert any("no node took the accounts" in s for s in op["steps"])
+
+
+def test_a_new_region_with_nothing_to_report_adds_no_line(tmp_path):
+    e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=AWS9)
+    db.regions = [r.name for r in AWS9.regions] + ["ap-northeast-1"]
+    e.add_region("ap-northeast-1", "aws", 3)
+    plain = ops.snapshot()["steps"]
+    e2, _, db2, _, _, _, ops2 = make(tmp_path, topo=AWS9)
+    db2.regions = list(db.regions)
+    e2.after_region_added.append(lambda name: None)  # Payments is not running
+    e2.add_region("ap-northeast-1", "aws", 3)
+    assert ops2.snapshot()["steps"] == plain
+
+
+@pytest.mark.parametrize("goal, nodes, offered", [("region", 1, False), ("region", 2, True), ("zone", 2, False), ("zone", 3, True)])
+def test_payments_are_offered_a_new_region_only_when_it_can_hold_their_copies(tmp_path, goal, nodes, offered):
+    """REGION survival keeps two copies of a region's payments in that region and ZONE survival all three: a region
+    with fewer nodes joins the databases, but no customer is homed there."""
+    from dataclasses import replace
+    e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=replace(AWS9, survival_goal=goal))
+    db.regions = [r.name for r in AWS9.regions] + ["ap-northeast-1"]
+    seen = []
+    e.after_region_added.append(seen.append)
+    e.add_region("ap-northeast-1", "aws", nodes)
+    op = ops.snapshot()
+    assert op["status"] == "done", op
+    assert seen == (["ap-northeast-1"] if offered else [])
+    explained = [s for s in op["steps"] if "Payments keeps its customers" in s]
+    assert bool(explained) is not offered
+    if explained:
+        assert f"{nodes} node" in explained[0] and goal.upper() in explained[0]
+
+
+def test_what_payments_did_before_a_region_left_is_logged(tmp_path):
+    e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=AWS)
+    e.before_region_removal.append(lambda name: f"2,500 Payments accounts moved from {name} while Payments kept running")
+    e.remove_region("us-west-2")
+    op = ops.snapshot()
+    assert op["status"] == "done", op
+    assert "2,500 Payments accounts moved from us-west-2 while Payments kept running" in op["steps"]
+
+
+def test_remove_region_evacuates_before_dropping_and_says_when_it_is_over(tmp_path):
     e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=AWS)
     order = []
     e.before_region_removal.append(lambda name: (order.append(("evacuate", name)), db.sql.append("-- evacuated")))
-    e.after_region_removal.append(lambda name: order.append(("resume", name, len(prov.topology.regions))))
+    e.after_region_removal.append(lambda name: order.append(("over", name, len(prov.topology.regions))))
     e.remove_region("us-west-2")
     assert ops.snapshot()["status"] == "done"
     joined = "\n".join(db.sql)
     # Before anything changes: a refused evacuation must leave the cluster as it was.
     assert joined.index("-- evacuated") < joined.index("DROP SECONDARY REGION") < joined.index('DROP REGION IF EXISTS "us-west-2"')
-    assert order == [("evacuate", "us-west-2"), ("resume", "us-west-2", 2)]
+    assert order == [("evacuate", "us-west-2"), ("over", "us-west-2", 2)]
 
 
-def test_payments_resume_even_when_the_removal_fails(tmp_path):
+def test_payments_hear_that_a_removal_is_over_even_when_it_failed(tmp_path):
     e, docker, db, prov, lb, chaos, ops = make(tmp_path, topo=AWS)
     db.fail_on = "DROP REGION"
-    resumed = []
-    e.after_region_removal.append(lambda name: resumed.append(name))
+    over = []
+    e.after_region_removal.append(lambda name: over.append(name))
     e.remove_region("us-west-2")
     op = ops.snapshot()
     assert op["status"] == "failed" and "homed" in op["error"]
-    assert resumed == ["us-west-2"]
+    assert over == ["us-west-2"]
 
 
 def test_a_hook_that_fails_without_a_message_still_names_the_failure(tmp_path):

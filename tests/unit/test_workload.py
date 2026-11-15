@@ -3,6 +3,7 @@ import random
 import psycopg
 import pytest
 
+from controlplane.homing import shares
 from controlplane.workload import ACCOUNTS, MAX_RETRIES, TOTAL, Stats, Workload, classify, recovery_time
 
 
@@ -281,6 +282,8 @@ class HomedCursor(FakeCursor):
             return (name, self.db.layout[name][1])
         if "SHOW RANGE FROM TABLE" in last:
             region = last.split("FOR ROW ('")[1].split("'")[0]
+            if getattr(self.db, "range_of", None):  # a test says where each partition's range is
+                return self.db.range_of(last.split("FROM TABLE ")[1].split()[0], region)
             return (42, 7 if self.db.holder_home else 9, [7, 8, 9],
                     [f"region={region},zone=a", f"region={region},zone=b", "region=elsewhere,zone=a"])
         return super().fetchone()
@@ -343,12 +346,11 @@ def test_payments_home_no_accounts_or_workers_in_a_tie_breaker():
 
 
 def test_evacuating_never_moves_accounts_into_a_tie_breaker():
-    db = HomedDB(regions=("eu-west-1", "us-east-1", "us-west-2"), layout={"accounts": HOMED, "transfers": HOMED},
-                 counts={"us-east-1": 5000, "us-west-2": 5000})
+    db = LedgerDB(ledger(("us-east-1", "us-west-2")), regions=("eu-west-1", "us-east-1", "us-west-2"))
     db.primary = "us-east-1"
     w = Workload(db.connect, host="haproxy", cluster=lambda: TIE)
     w.evacuate("us-east-1")
-    assert ("UPDATE accounts SET crdb_region = %s WHERE crdb_region = %s", ("us-west-2", "us-east-1")) in db.calls
+    assert {r: len(ids) for r, ids in db.accounts.items() if ids} == {"us-west-2": ACCOUNTS}
 
 
 def test_a_single_region_database_keeps_the_plain_layout():
@@ -451,28 +453,285 @@ def test_status_describes_the_homing():
     assert h["workers"] == {"us-east-1": 16, "us-west-2": 16, "eu-west-1": 16}
     plain = Workload(FakeDB(count=ACCOUNTS).connect, host="haproxy")
     plain.setup()
-    assert plain.status()["homing"] == {"on": False, "regions": [], "cross_region_pct": 10, "workers": {}, "failover": {}}
+    assert plain.status()["homing"] == {"on": False, "regions": [], "cross_region_pct": 10, "workers": {}, "failover": {},
+                                        "leaving": None}
 
 
-def test_evacuate_moves_a_regions_rows_to_the_primary_and_pauses_a_running_workload():
-    w, db = homed_workload(LIVE)
+# -- the regions change while Payments runs: accounts and workers follow, and nothing stops --
+
+class LedgerDB(HomedDB):
+    """A homed chaos database that keeps its accounts by region, so rows can move from one region to another.
+    transfer_rows: {region: rows homed there}; fail_move: raised by the statement that moves accounts."""
+    def __init__(self, accounts, regions=None):
+        super().__init__(regions=regions or list(accounts), layout={"accounts": HOMED, "transfers": HOMED})
+        self.accounts = {r: list(ids) for r, ids in accounts.items()}
+        self.transfer_rows: dict[str, int] = {}
+        self.fail_move = None
+        self.moved_anyway = False  # with fail_move: the move committed before the error reached the client
+
+    def cursor(self):
+        return LedgerCursor(self)
+
+    def connect(self, host, **kw):
+        conn, db = super().connect(host, **kw), self
+
+        class Commit:  # the rows moved, but the client never hears the commit's answer
+            def __enter__(self):
+                return self
+
+            def __exit__(self, failed, *rest):
+                if failed is None and db.fail_move and db.moved_anyway:
+                    raise db.fail_move
+                return False
+        conn.transaction = Commit
+        return conn
+
+
+class LedgerCursor(HomedCursor):
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        self.db.rowcount = 1
+        if sql.startswith("UPDATE accounts SET crdb_region"):
+            if self.db.fail_move and not self.db.moved_anyway:
+                raise self.db.fail_move
+            target, source, ids = params
+            there = set(self.db.accounts.get(source, ()))
+            found = [i for i in ids if i in there]
+            self.db.accounts[source] = [i for i in self.db.accounts.get(source, ()) if i not in set(found)]
+            self.db.accounts.setdefault(target, []).extend(found)
+            self.db.rowcount = len(found)
+        elif sql.startswith("DELETE FROM transfers"):
+            left = self.db.transfer_rows.get(params[0], 0)
+            self.db.rowcount = min(left, params[1])
+            self.db.transfer_rows[params[0]] = left - self.db.rowcount
+
+    def fetchall(self):
+        if "SELECT crdb_region, id FROM accounts" in self.last:
+            return [(r, i) for r, ids in self.db.accounts.items() for i in ids]
+        if "crdb_region, count(*)" in self.last:
+            return [(r, len(ids)) for r, ids in self.db.accounts.items() if ids]
+        return super().fetchall()
+
+    def fetchone(self):
+        sql, params = self.db.calls[-1]
+        if sql.startswith("SELECT count(*) FROM accounts WHERE crdb_region = %s AND id = %s"):
+            return (int(params[1] in self.db.accounts.get(params[0], ())),)
+        return super().fetchone()
+
+
+THREE = ("us-east-1", "us-west-2", "eu-west-1")
+FOUR = (*THREE, "ap-northeast-1")
+
+
+def ledger(regions=THREE):
+    """Account ids by region, the way setup seeds a database with these regions."""
+    return {r: [f"{k:08d}-0000-0000-0000-{i:012d}" for i in range(n)] for k, (r, n) in enumerate(shares(ACCOUNTS, regions).items())}
+
+
+def running_workload(regions=THREE, snapshot=LIVE):
+    """Payments running on a database with these regions. No threads: a test plays the workers' turns itself."""
+    db = LedgerDB(ledger(regions))
+    w = Workload(db.connect, host="haproxy", cluster=lambda: snapshot, sleep=lambda s: None)
+    w.setup()
     w.running = True
-    w.evacuate("eu-west-1")
-    assert ("UPDATE accounts SET crdb_region = %s WHERE crdb_region = %s", ("us-east-1", "eu-west-1")) in db.calls
-    assert "TRUNCATE transfers" in db.sql  # transfer rows only dedupe in-flight retries, and Payments is stopped
-    assert not any(s.startswith("UPDATE transfers") for s in db.sql)
-    assert w.running is False and w.regions == ["us-east-1", "us-west-2"] and "eu-west-1" not in w._homes
-    assert w.status()["paused_for"] == "eu-west-1"
-    with pytest.raises(RuntimeError, match="paused while eu-west-1 is removed"):
-        w.start()
-    w.resume("eu-west-1")
-    assert w.running is True and w.status()["paused_for"] is None
+    w.stop = lambda: (_ for _ in ()).throw(AssertionError("Payments were stopped"))
+    w._background = lambda work: None  # no threads in tests; the one about leases below runs the work itself
+    db.sql.clear()
+    db.calls.clear()
+    return w, db
 
 
-def test_evacuating_the_primary_moves_rows_to_the_next_region():
-    w, db = homed_workload(LIVE)
+def homed(db):
+    return {r: len(ids) for r, ids in db.accounts.items() if ids}
+
+
+def moved(db):
+    return [s for s in db.sql if s.startswith("UPDATE accounts SET crdb_region")]
+
+
+def test_a_region_is_evacuated_while_payments_keep_running():
+    w, db = running_workload(FOUR)
+    db.transfer_rows["ap-northeast-1"] = 12_000
+    note = w.evacuate("ap-northeast-1")
+    assert w.running is True  # stop() would have raised
+    assert homed(db) == {"us-east-1": 3334, "us-west-2": 3333, "eu-west-1": 3333}
+    assert w.regions == list(THREE) and {r: sorted(ids) for r, ids in w._homes.items()} == {r: sorted(db.accounts[r]) for r in THREE}
+    assert len(w._ids) == ACCOUNTS
+    assert db.transfer_rows["ap-northeast-1"] == 0  # the region homes no row any more: DROP REGION can run
+    assert not any(s.startswith("TRUNCATE") for s in db.sql)  # other regions' transfer rows still dedupe live retries
+    assert w.status()["homing"]["leaving"] == "ap-northeast-1" and "2,500" in note
+    # The stage shows a region's nodes as draining when a step of the removal names the region: the line names only
+    # the one that leaves, or every node on the stage would look as if it were draining.
+    assert "ap-northeast-1" in note and not any(region in note for region in THREE)
+    w.removal_done("ap-northeast-1")
+    assert w.status()["homing"]["leaving"] is None
+
+
+@pytest.mark.parametrize("in_flight", [
+    lambda w: ("us-east-1", w._homes["us-east-1"][0], w._homes["ap-northeast-1"][0]),   # pays an account that will move
+    lambda w: ("ap-northeast-1", w._homes["ap-northeast-1"][0], w._homes["us-east-1"][0]),  # sent from the leaving region
+], ids=["to-an-account-that-moves", "homed-in-the-leaving-region"])
+def test_rows_move_only_after_the_payments_already_on_their_way_have_finished(in_flight):
+    w, db = running_workload(FOUR)
+    w._inflight[7] = in_flight(w)
+    moved_at_each_wait = []
+
+    def wait(seconds):
+        moved_at_each_wait.append(len(moved(db)))
+        if len(moved_at_each_wait) == 3:
+            w._inflight.pop(7)  # the payment finishes
+    w._sleep = wait
+    w.evacuate("ap-northeast-1")
+    assert moved_at_each_wait == [0, 0, 0] and moved(db)
+
+
+def test_no_new_payment_can_choose_an_account_while_it_is_moving():
+    w, db = running_workload(FOUR)
+    leaving = set(w._homes["ap-northeast-1"])
+    w._inflight[7] = ("ap-northeast-1", w._homes["ap-northeast-1"][0], w._homes["ap-northeast-1"][1])
+    seen = []
+
+    def wait(seconds):  # while the evacuation waits, the other workers keep paying
+        for index in range(12):
+            seen.append(w._next(index, random.Random(index)))
+        w._inflight.clear()
+    w._sleep = wait
+    w.evacuate("ap-northeast-1")
+    assert seen and all(home != "ap-northeast-1" and a not in leaving and b not in leaving for home, a, _, b, _ in seen)
+
+
+def test_an_evacuation_that_cannot_wait_out_a_payment_changes_nothing():
+    w, db = running_workload(FOUR)
+    w._inflight[7] = ("ap-northeast-1", w._homes["ap-northeast-1"][0], w._homes["ap-northeast-1"][1])
+    before = {r: list(ids) for r, ids in w._homes.items()}
+    with pytest.raises(RuntimeError, match="in flight"):
+        w.evacuate("ap-northeast-1")  # the payment never finishes
+    assert not any(s.startswith(("UPDATE", "DELETE")) for s in db.sql)
+    assert w.regions == list(FOUR) and w._homes == before and w.status()["homing"]["leaving"] is None
+
+
+def test_accounts_that_could_not_move_are_back_in_reach():
+    w, db = running_workload(FOUR)
+    db.fail_move = SqlState("XX000")
+    before = {r: list(ids) for r, ids in w._homes.items()}
+    with pytest.raises(SqlState):
+        w.evacuate("ap-northeast-1")
+    assert w.regions == list(FOUR) and w._homes == before and w.status()["homing"]["leaving"] is None
+
+
+def test_a_move_whose_commit_was_never_answered_is_checked_in_the_database():
+    """A dropped connection or an ambiguous result at COMMIT leaves the client not knowing. Putting the accounts back
+    in reach at their old home would then be wrong if the rows did move: every payment to them would miss its row."""
+    w, db = running_workload(FOUR)
+    db.fail_move, db.moved_anyway = SqlState("40003"), True
+    note = w.evacuate("ap-northeast-1")
+    assert "2,500" in note and w.regions == list(THREE)
+    assert {r: sorted(ids) for r, ids in w._homes.items()} == {r: sorted(db.accounts[r]) for r in THREE}
+
+    w, db = running_workload(FOUR)
+    db.fail_move = SqlState("40003")  # same answer, but this time nothing moved
+    before = {r: list(ids) for r, ids in w._homes.items()}
+    with pytest.raises(SqlState):
+        w.evacuate("ap-northeast-1")
+    assert w.regions == list(FOUR) and w._homes == before
+
+
+def test_a_move_that_misses_rows_is_an_error_not_a_silent_loss_of_track():
+    w, db = running_workload(FOUR)
+    db.accounts["ap-northeast-1"].pop()  # the database holds one account fewer than the plan was made for
+    orig = LedgerCursor.fetchall
+    stale = [(r, i) for r, ids in ledger(FOUR).items() for i in ids]
+    LedgerCursor.fetchall = lambda self: stale if "SELECT crdb_region, id FROM accounts" in self.last else orig(self)
+    try:
+        with pytest.raises(RuntimeError, match="were to move"):
+            w.evacuate("ap-northeast-1")
+    finally:
+        LedgerCursor.fetchall = orig
+    assert w.regions == list(FOUR)
+
+
+def test_a_worker_follows_its_customers_to_their_new_region():
+    w, db = running_workload(FOUR)
+    sent, closed = [], []
+    w._send = lambda state, a, b, amount, rng, **kw: sent.append((state["home"], kw["a_home"]))
+    w._close = lambda state: closed.append(state.get("home"))
+    state, rng = {"conn": None, "home": None}, random.Random(1)
+    w._turn(3, state, rng)  # the fourth worker serves the fourth region
+    assert sent[-1] == ("ap-northeast-1", "ap-northeast-1")
+    w.evacuate("ap-northeast-1")
+    w._turn(3, state, rng)
+    assert sent[-1] == ("us-east-1", "us-east-1")  # dealt over three regions now
+    assert closed == [None, "ap-northeast-1"]  # it left its connection in the old region and connects in the new one
+
+
+def test_a_worker_whose_region_stays_keeps_its_home_and_its_connection():
+    """Dealing the workers afresh whenever the regions change would move three in four of them and reconnect each one:
+    a storm of new connections at the very moment the cluster is busy changing shape."""
+    w, db = running_workload()
+    sent, closed = [], []
+    w._send = lambda state, a, b, amount, rng, **kw: sent.append(state["home"])
+    w._close = lambda state: closed.append(state.get("home"))
+    states = [{"conn": None, "home": None} for _ in range(w.workers)]
+    for index, state in enumerate(states):
+        w._turn(index, state, random.Random(index))
+    first, closed[:] = list(sent), []
+    db.regions.append("ap-northeast-1")
+    w.expand("ap-northeast-1")
+    for index, state in enumerate(states):
+        w._turn(index, state, random.Random(index))
+    second = sent[len(first):]
+    moved = [i for i in range(w.workers) if first[i] != second[i]]
+    assert len(moved) == 12 and all(second[i] == "ap-northeast-1" for i in moved)
+    assert len(closed) == 12  # only the workers that moved left their connection
+    closed[:] = []
+    w.evacuate("ap-northeast-1")
+    for index, state in enumerate(states):
+        w._turn(index, state, random.Random(index))
+    third = sent[len(first) + len(second):]
+    assert len(closed) == 12 and "ap-northeast-1" not in third
+    assert {r: third.count(r) for r in THREE} == {r: 16 for r in THREE}
+
+
+def test_a_transfer_counts_as_in_flight_until_it_has_finished_whatever_happens():
+    w, db = running_workload()
+    during = {}
+
+    def send(state, a, b, amount, rng, **kw):
+        during.update(w._inflight)
+        raise RuntimeError("boom")
+    w._send = send
+    with pytest.raises(RuntimeError, match="boom"):
+        w._turn(5, {"conn": None, "home": None}, random.Random(2))
+    (home, a, b), = during.values()
+    assert home == "eu-west-1" and a in w._homes["eu-west-1"]  # the sixth worker serves the third region
+    assert w._inflight == {}
+
+
+def test_a_worker_whose_region_has_no_account_in_reach_skips_its_turn():
+    w, db = running_workload()
+    w._homes["us-west-2"] = []
+    w._send = lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent"))
+    assert w._turn(1, {"conn": None, "home": None}, random.Random(1)) is None and w._inflight == {}
+
+
+def test_payments_started_during_a_removal_home_nothing_in_the_leaving_region():
+    db = LedgerDB(ledger(FOUR))
+    w = Workload(db.connect, host="haproxy", cluster=lambda: LIVE, sleep=lambda s: None)
+    w.evacuate("ap-northeast-1")  # Payments is not running: the rows simply move
+    assert homed(db) == {"us-east-1": 3334, "us-west-2": 3333, "eu-west-1": 3333}
+    db.sql.clear()
+    w.setup()  # DROP REGION has not run yet: the database still lists the region
+    assert w.regions == list(THREE) and "ap-northeast-1" not in w._homes
+    assert not any(s.startswith(("TRUNCATE", "INSERT INTO accounts")) for s in db.sql)  # nothing reseeded
+    w.removal_done("ap-northeast-1")
+    w.setup()  # the removal gave up and the region stayed: accounts may live there again
+    assert w.regions == list(FOUR)
+
+
+def test_evacuating_the_primary_spreads_its_accounts_over_the_other_regions():
+    w, db = running_workload()
     w.evacuate("us-east-1")
-    assert ("UPDATE accounts SET crdb_region = %s WHERE crdb_region = %s", ("us-west-2", "us-east-1")) in db.calls
+    assert homed(db) == {"us-west-2": 5000, "eu-west-1": 5000} and w.primary == "us-west-2"
 
 
 def test_evacuate_does_nothing_in_plain_mode():
@@ -480,27 +739,129 @@ def test_evacuate_does_nothing_in_plain_mode():
     w = Workload(db.connect, host="haproxy")
     w.setup()
     w.running = True
-    w.evacuate("us-east-1")
-    assert not any(s.startswith(("UPDATE", "TRUNCATE")) for s in db.sql)  # a look at the layout is fine
-    assert w.running is True and w.status()["paused_for"] is None
-    w.resume("us-east-1")
+    assert w.evacuate("us-east-1") is None
+    assert not any(s.startswith(("UPDATE", "TRUNCATE", "DELETE")) for s in db.sql)  # a look at the layout is fine
+    assert w.running is True and w.status()["homing"]["leaving"] is None
+    w.removal_done("us-east-1")
     assert w.running is True
 
 
 def test_evacuate_works_on_a_workload_that_never_started_in_this_process():
     """After a control-plane restart nothing has called setup(), but the tables still hold homed rows."""
-    db = HomedDB(layout={"accounts": HOMED, "transfers": HOMED}, counts=FULL)
+    db = LedgerDB(ledger())
     w = Workload(db.connect, host="haproxy", cluster=dict)
     w.evacuate("eu-west-1")
-    assert ("UPDATE accounts SET crdb_region = %s WHERE crdb_region = %s", ("us-east-1", "eu-west-1")) in db.calls
+    assert homed(db) == {"us-east-1": 5000, "us-west-2": 5000}
 
 
 def test_evacuating_the_only_region_is_refused_with_a_reason():
-    db = HomedDB(regions=("us-east-1",), layout={"accounts": HOMED, "transfers": HOMED}, counts={"us-east-1": 10000})
+    db = LedgerDB(ledger(("us-east-1",)))
     w = Workload(db.connect, host="haproxy", cluster=dict)
     with pytest.raises(RuntimeError, match="only region"):
         w.evacuate("us-east-1")
-    assert not any(s.startswith(("UPDATE", "TRUNCATE")) for s in db.sql)
+    assert not any(s.startswith(("UPDATE", "TRUNCATE", "DELETE")) for s in db.sql)
+    assert w.status()["homing"]["leaving"] is None
+
+
+def test_a_region_with_nothing_homed_in_it_leaves_without_a_word():
+    w, db = running_workload()          # three regions serve...
+    db.regions.append("ap-northeast-1")  # ...and a fourth joined the database but never got accounts
+    assert w.evacuate("ap-northeast-1") is None
+    assert not moved(db) and w.regions == list(THREE) and w.running is True
+
+
+def test_a_region_that_joins_takes_its_share_of_customers_while_payments_run():
+    w, db = running_workload()
+    db.regions.append("ap-northeast-1")  # ALTER DATABASE ... ADD REGION has run
+    note = w.expand("ap-northeast-1")
+    assert w.running is True  # stop() would have raised
+    assert homed(db) == {r: 2500 for r in FOUR}
+    assert w.regions == list(FOUR) and {r: sorted(ids) for r, ids in w._homes.items()} == {r: sorted(db.accounts[r]) for r in FOUR}
+    assert w.status()["homing"]["workers"] == {r: 12 for r in FOUR}
+    assert "ap-northeast-1" in note and "2,500" in note
+
+
+def new_region_ranges(db, region, phase):
+    """Where the partitions of a region that just joined are: phase["now"] is "no replica yet", "replicas arrived"
+    or "home". Every other region's lease is at home."""
+    def range_of(table, asked):
+        at_home = [f"region={asked},zone=a", f"region={asked},zone=b"]
+        if asked != region or phase["now"] == "home":
+            return (42, 7, [7, 8, 9], [*at_home, "region=elsewhere,zone=a"])
+        if phase["now"] == "no replica yet":
+            return (42, 9, [9, 10, 11], ["region=us-east-1,zone=a", "region=us-west-2,zone=a", "region=eu-west-1,zone=a"])
+        return (42, 9, [7, 8, 9], [*at_home, "region=us-east-1,zone=a"])
+    db.range_of = range_of
+
+
+def test_a_new_regions_leases_come_home_once_it_holds_replicas():
+    """Right after ADD REGION the region's partitions have no replica there yet, so their leases cannot move home and
+    every statement of its payments crosses an ocean. Payments keeps looking and moves each lease as soon as it can."""
+    w, db = running_workload()
+    later, phase = [], {"now": "no replica yet"}
+    w._background = later.append
+    new_region_ranges(db, "ap-northeast-1", phase)
+    db.regions.append("ap-northeast-1")
+    w.expand("ap-northeast-1")
+    assert len(later) == 1 and not any("RELOCATE" in s for s in db.sql)  # nothing there to hold the lease yet
+    waits = []
+
+    def wait(seconds):
+        waits.append(seconds)
+        phase["now"] = ["replicas arrived", "home"][min(len(waits) - 1, 1)]
+        return False
+    w._stop.wait = wait
+    later[0]()
+    assert db.sql.count("ALTER RANGE 42 RELOCATE LEASE TO 7") == 2  # accounts and transfers, once replicas were there
+    assert len(waits) == 2  # and it stopped looking when both were home
+
+
+def test_the_search_for_a_new_regions_leases_ends_with_payments_or_with_the_region():
+    w, db = running_workload()
+    later, phase = [], {"now": "no replica yet"}
+    w._background = later.append
+    new_region_ranges(db, "ap-northeast-1", phase)
+    db.regions.append("ap-northeast-1")
+    w.expand("ap-northeast-1")
+    db.sql.clear()
+    w._stop.wait = lambda seconds: True  # Payments stopped
+    later[0]()
+    assert db.sql == []
+    waits = []
+    w._stop.wait = lambda seconds: waits.append(seconds) or False
+    w.regions = [r for r in w.regions if r != "ap-northeast-1"]  # the region left again
+    later[0]()
+    assert db.sql == [] and len(waits) == 1
+    w.regions = list(FOUR)  # it stays without replicas: the search gives up in the end instead of running for ever
+    del waits[:]
+    later[0]()
+    # ...but not soon: the allocator has every range of the databases to place after ADD REGION, and in one take the
+    # new region's partitions waited more than seven minutes for their turn. Five-second looks for at least 15 minutes.
+    assert 180 <= len(waits) < 1000 and all(seconds == 5.0 for seconds in waits) and not any("RELOCATE" in s for s in db.sql)
+
+
+def test_a_region_that_joins_while_payments_are_stopped_is_left_for_the_next_start():
+    db = LedgerDB(ledger())
+    w = Workload(db.connect, host="haproxy", cluster=lambda: LIVE, sleep=lambda s: None)
+    w.setup()
+    db.sql.clear()
+    db.regions.append("ap-northeast-1")
+    assert w.expand("ap-northeast-1") is None and db.sql == []
+
+
+def test_a_tie_breaker_that_joins_gets_no_customers():
+    w, db = running_workload(("us-east-1", "us-west-2"), snapshot=TIE)
+    db.regions.append("eu-west-1")
+    assert w.expand("eu-west-1") is None and not moved(db) and w.regions == ["us-east-1", "us-west-2"]
+
+
+def test_a_plain_workload_ignores_a_region_that_joins():
+    db = FakeDB(count=ACCOUNTS)
+    w = Workload(db.connect, host="haproxy")
+    w.setup()
+    w.running = True
+    db.sql.clear()
+    assert w.expand("us-east-1") is None and db.sql == []
 
 
 def test_a_homed_update_that_hits_no_row_rolls_the_transfer_back():

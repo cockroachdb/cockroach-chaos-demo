@@ -1,6 +1,6 @@
 import random
 
-from controlplane.homing import gateway_candidates, home_of, region_order, workers_by_region
+from controlplane.homing import deal, gateway_candidates, home_of, region_order, rehoming, shares, workers_by_region
 
 REGIONS = [{"name": "us-east-1", "location": [38.9, -77.4], "primary": True},
            {"name": "us-west-2", "location": [45.8, -119.7], "primary": False},
@@ -48,3 +48,71 @@ def test_failover_goes_to_a_serving_region_before_a_nearer_tie_breaker():
                {"name": "eastus", "location": [37.4, -79.8], "secondary": True},
                {"name": "us-east4", "location": [39.0, -77.5], "tie_breaker": True}]
     assert region_order("us-east-1", regions) == ["us-east-1", "eastus", "us-east4"]
+
+
+# -- accounts follow the regions: a region that joins takes its share, one that leaves gives everything up --
+
+def _accounts(region, count):
+    return [f"{region}-{i}" for i in range(count)]
+
+
+def test_accounts_are_shared_evenly_with_the_remainder_to_the_first_regions():
+    assert shares(10_000, ["a", "b", "c"]) == {"a": 3334, "b": 3333, "c": 3333}
+    assert shares(10_000, ["a", "b", "c", "d"]) == {"a": 2500, "b": 2500, "c": 2500, "d": 2500}
+
+
+def test_a_region_that_leaves_gives_every_account_to_the_regions_that_stay():
+    have = {r: _accounts(r, 2500) for r in ("a", "b", "c", "d")}
+    moves = rehoming(have, ["a", "b", "c"])
+    assert {(source, target): len(ids) for source, target, ids in moves} == {("d", "a"): 834, ("d", "b"): 833, ("d", "c"): 833}
+    assert sorted(i for _, _, ids in moves for i in ids) == sorted(have["d"])  # every one of them, each once
+
+
+def test_a_region_that_joins_takes_its_share_from_the_others():
+    have = {"a": _accounts("a", 3334), "b": _accounts("b", 3333), "c": _accounts("c", 3333)}
+    moves = rehoming(have, ["a", "b", "c", "d"])
+    assert {(source, target): len(ids) for source, target, ids in moves} == {("a", "d"): 834, ("b", "d"): 833, ("c", "d"): 833}
+    assert len({i for _, _, ids in moves for i in ids}) == 2500
+
+
+def test_a_layout_that_is_already_even_needs_no_moves():
+    have = {"a": _accounts("a", 3334), "b": _accounts("b", 3333), "c": _accounts("c", 3333)}
+    assert rehoming(have, ["a", "b", "c"]) == []
+
+
+def test_the_moves_leave_exactly_the_layout_a_fresh_setup_seeds():
+    have = {"a": _accounts("a", 9000), "b": _accounts("b", 1000), "old": _accounts("old", 0)}
+    after = {r: len(ids) for r, ids in have.items()}
+    for source, target, ids in rehoming(have, ["a", "b", "c"]):
+        after[source] -= len(ids)
+        after[target] = after.get(target, 0) + len(ids)
+    assert after == {"a": 3334, "b": 3333, "c": 3333, "old": 0}
+
+
+# -- workers follow the regions too, and only as many move as must --
+
+def test_a_fresh_deal_is_round_robin():
+    regions = ["a", "b", "c"]
+    assert deal([None] * 5, regions) == [home_of(i, regions) for i in range(5)] == ["a", "b", "c", "a", "b"]
+
+
+def test_when_a_region_joins_only_its_share_of_the_workers_moves():
+    before = deal([None] * 48, ["a", "b", "c"])
+    after = deal(before, ["a", "b", "c", "d"])
+    assert {r: after.count(r) for r in "abcd"} == workers_by_region(48, ["a", "b", "c", "d"]) == {"a": 12, "b": 12, "c": 12, "d": 12}
+    moved = [i for i in range(48) if before[i] != after[i]]
+    assert len(moved) == 12 and all(after[i] == "d" for i in moved)  # the other 36 keep their region and their connection
+
+
+def test_when_a_region_leaves_only_its_workers_move():
+    before = deal([None] * 48, ["a", "b", "c", "d"])
+    after = deal(before, ["a", "b", "c"])
+    assert {r: after.count(r) for r in "abc"} == {"a": 16, "b": 16, "c": 16}
+    assert all(before[i] == "d" for i in range(48) if before[i] != after[i])
+    assert [after[i] for i in range(48) if before[i] == "d"][:4] == ["a", "b", "c", "a"]  # spread over the regions that stay
+
+
+def test_a_deal_copes_with_uneven_numbers():
+    before = deal([None] * 4, ["a", "b", "c"])  # a, b, c, a
+    after = deal(before, ["a", "b"])
+    assert sorted(after) == ["a", "a", "b", "b"] and after[:2] == ["a", "b"]

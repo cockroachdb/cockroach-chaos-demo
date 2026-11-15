@@ -9,8 +9,8 @@ import uuid
 from collections import deque
 from typing import Callable
 
-from .homing import gateway_candidates, home_of, workers_by_region
-from .retry import RETRYABLE, abandon_after, backoff_delay, classify, retry_with_backoff
+from .homing import deal, gateway_candidates, rehoming, shares, workers_by_region
+from .retry import RETRYABLE, abandon_after, backoff_delay, classify, may_have_committed, retry_with_backoff
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,12 @@ HOMED_TRANSFERS_DDL = ("CREATE TABLE IF NOT EXISTS transfers (crdb_region crdb_i
                        "src UUID NOT NULL, dst UUID NOT NULL, amount INT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now(), "
                        "PRIMARY KEY (crdb_region, id)) WITH (ttl_expire_after = '1 hour') LOCALITY REGIONAL BY ROW")
 NO_ROW = "00000000-0000-0000-0000-000000000000"
+SETTLE_SECONDS = 20.0  # how long a re-homing waits for the payments already on their way to an account that moves
+FORGET_BATCH = 5_000  # transfer rows deleted per statement when a region leaves
+# x 5 s: how long Payments keeps trying to bring a new region's leases home. After ADD REGION the allocator has every
+# range of the databases to place; the new region's partitions usually get replicas within a minute or two, but once
+# waited more than seven.
+LEASE_ATTEMPTS = 240
 
 
 def baseline_before(history: list[dict], failure_at: float) -> float:
@@ -155,8 +161,12 @@ class Workload:
         self._homes: dict[str, list[str]] = {}  # account ids by home region
         self.cross_region_pct = 10  # share of transfers that pay an account in another region on purpose
         self._failover: dict[str, str | None] = {}  # home region -> the region serving it instead, or None
-        self._paused_for_removal = False
-        self._removing: str | None = None  # a region being removed: Payments stays paused until resume()
+        self._leaving: str | None = None  # a region being removed: nothing is homed there any more
+        self._routes = threading.Lock()  # a worker's pick and a re-homing never interleave (see _rehome)
+        self._background: Callable[[Callable[[], None]], None] = (
+            lambda work: threading.Thread(target=work, daemon=True, name="payments-leases").start())
+        self._inflight: dict[int, tuple[str, str, str]] = {}  # worker -> (home, source, destination) of its transfer
+        self._dealt: list[str] = []  # every worker's home region (homing.deal); redealt when the regions change
         self._events = events
         self._clock = clock
         self._sleep = sleep
@@ -206,9 +216,7 @@ class Workload:
             with conn.cursor() as cur:
                 regions, primary = self._database_regions(cur) if self.cluster is not None else ([], None)
                 if regions:
-                    # A tie-breaker only votes: no accounts and no workers are homed there.
-                    tie = self._tie_breakers()
-                    self._setup_homed(cur, [r for r in regions if r not in tie] or regions, primary)
+                    self._setup_homed(cur, self._serving(regions) or regions, primary)
                 else:
                     self._setup_plain(cur)
         finally:
@@ -218,6 +226,13 @@ class Workload:
         """Regions the topology marks as tie-breakers, from the collector's latest snapshot."""
         snap = self.cluster() if self.cluster else None
         return {r["name"] for r in (snap or {}).get("regions", []) if r.get("tie_breaker")}
+
+    def _serving(self, regions: list[str]) -> list[str]:
+        """The regions that home accounts and workers: not one that is leaving, and not a tie-breaker, which only
+        votes."""
+        staying = [r for r in regions if r != self._leaving]
+        tie = self._tie_breakers()
+        return [r for r in staying if r not in tie] or staying
 
     @staticmethod
     def _database_regions(cur) -> tuple[list[str], str | None]:
@@ -259,8 +274,7 @@ class Workload:
                 cur.execute(f"DROP TABLE {name}")  # the plain layout: transfers expire hourly and accounts are reseeded
         cur.execute(HOMED_ACCOUNTS_DDL)
         cur.execute(HOMED_TRANSFERS_DDL)
-        n = len(regions)
-        expected = {r: ACCOUNTS // n + (1 if i < ACCOUNTS % n else 0) for i, r in enumerate(regions)}
+        expected = shares(ACCOUNTS, regions)
         cur.execute("SELECT crdb_region, count(*) FROM accounts GROUP BY 1")
         have = {str(r): int(c) for r, c in cur.fetchall()}
         if have != expected:
@@ -275,13 +289,16 @@ class Workload:
         self._homes = homes
         self._ids = [i for ids in homes.values() for i in ids]
         self.homed, self.regions, self.primary = True, list(regions), primary
+        self._dealt = deal([None] * self.workers, self.regions)
         self._pin_leases(cur)
 
-    def _pin_leases(self, cur) -> None:
+    def _pin_leases(self, cur, regions: list[str] | None = None) -> bool:
         """Move each partition's lease to its home region now instead of waiting minutes for the allocator.
         Best effort: the allocator gets there on its own. Region names are validated by the topology and
-        the ids are UUIDs from the database, so they are safe to inline."""
-        for region in self.regions:
+        the ids are UUIDs from the database, so they are safe to inline. Returns whether every lease looked at
+        was at home already; one that is not may have nowhere to go yet (a new region holds no replica at first)."""
+        at_home = True
+        for region in self.regions if regions is None else regions:
             first = (self._homes.get(region) or [None])[0]
             for table, ident in (("accounts", first), ("transfers", NO_ROW)):
                 if ident is None:
@@ -294,17 +311,39 @@ class Workload:
                         continue
                     range_id, holder, replicas, localities = info
                     home = [int(r) for r, loc in zip(replicas, localities) if f"region={region}," in f"{loc},"]
-                    if home and int(holder) not in home:
+                    if int(holder) in home:
+                        continue
+                    at_home = False
+                    if home:
                         cur.execute(f"ALTER RANGE {int(range_id)} RELOCATE LEASE TO {home[0]}")
                 except Exception as e:
+                    at_home = False
                     log.debug("lease for %s in %s not pinned: %s", table, region, e)
+        return at_home
+
+    def _settle_leases(self, region: str) -> None:
+        """In the background after a region joined: right after ADD REGION its partitions hold no replica there, so
+        their leases cannot move home yet and every statement of the region's payments goes to another region.
+        Look every few seconds and move each lease as soon as the region has a replica to hold it. Ends when the
+        leases are home, when Payments stops, when the region leaves again, or after twenty minutes."""
+        for _ in range(LEASE_ATTEMPTS):
+            if self._stop.wait(5.0) or region not in self.regions:
+                return
+            try:
+                conn = self._connect(self._host, statement_timeout="20s")
+                try:
+                    with conn.cursor() as cur:
+                        if self._pin_leases(cur, [region]):
+                            return
+                finally:
+                    conn.close()
+            except Exception as e:
+                log.debug("leases of %s not settled yet: %s", region, e)
 
     def start(self) -> None:
         with self._lock:
             if self.running:
                 return
-            if self._removing:
-                raise RuntimeError(f"Payments is paused while {self._removing} is removed")
             self.setup()
             self._failover = {}
             self._stop.clear()
@@ -324,48 +363,167 @@ class Workload:
             self.running = False
             self._failure_at = self._baseline = None  # a recovery can't be measured without traffic
 
-    def evacuate(self, region: str) -> None:
-        """Before a region leaves the database: move the accounts homed there to the primary region
-        (CockroachDB refuses DROP REGION while a row is homed in it), drop the transfer rows (they only dedupe
-        retries still in flight, and Payments is stopped by then) and keep the workload paused so nothing is
-        reseeded into the region before it is gone. The database is the authority on the layout and the
-        regions: after a control-plane restart nothing in this process has run setup() yet. resume() restarts."""
-        conn = self._connect(self._host, statement_timeout="120s")
+    # -- regions join and leave while Payments runs --
+
+    def expand(self, region: str) -> str | None:
+        """After a region joined the database, with Payments running: the region takes its share of the customers.
+        Accounts move there from the other regions and the workers are dealt over all of them again, the way an
+        application starts serving a new region. Nothing stops (see _rehome). Without Payments running there is
+        nothing to do: the next start seeds every region. Returns a line for the operation log, or None."""
+        with self._lock:
+            if not (self.running and self.homed) or region in self._tie_breakers():
+                return None
+            conn = self._connect(self._host, statement_timeout="120s")
+            try:
+                with conn.cursor() as cur:
+                    regions, _ = self._database_regions(cur)
+                    if region not in regions:
+                        return None
+                    moved = self._rehome(conn, cur, self._serving(regions))
+                    if moved and not self._pin_leases(cur, [region]):
+                        self._background(lambda: self._settle_leases(region))
+            finally:
+                conn.close()
+        return f"Payments now serves {region}: {moved:,} accounts are homed there" if moved else None
+
+    def evacuate(self, region: str) -> str | None:
+        """Before a region leaves the database, with Payments still running: its customers get a new home. Their
+        accounts are spread over the regions that stay (CockroachDB refuses DROP REGION while a row is homed in
+        the region) and the workers that served them connect there instead, the way an application re-points its
+        clients before a region is retired. Nothing stops (see _rehome). The region's transfer rows go last: they
+        only dedupe the retries of transfers sent from there, and those have all finished by then. The database is
+        the authority on the layout and the regions: after a control-plane restart nothing in this process has run
+        setup() yet. Until removal_done() nothing is homed in the region again, whoever starts Payments.
+        Returns a line for the operation log, or None when the region homed no account."""
+        with self._lock:
+            conn = self._connect(self._host, statement_timeout="120s")
+            try:
+                with conn.cursor() as cur:
+                    regions, _ = self._database_regions(cur)
+                    if region not in regions or not self._homed_in_database(cur):
+                        return None
+                    self._leaving = region
+                    try:
+                        staying = self._serving(regions)
+                        if not staying:
+                            raise RuntimeError(f"{region} is the only region with Payments accounts; nothing can take them")
+                        moved = self._rehome(conn, cur, staying, leaving=region)
+                    except BaseException:
+                        self._leaving = None  # nothing moved: the region homes its accounts as before
+                        raise
+                    self._forget_transfers(cur, region)
+            finally:
+                conn.close()
+            if self.primary == region:
+                self.primary = staying[0]
+        if not moved:
+            return None
+        # Names only the region that leaves: the stage shows a region's nodes as draining when a step names it.
+        how = "while Payments kept running" if self.running else "(Payments is stopped)"
+        return f"{moved:,} Payments accounts moved out of {region} to the {len(staying)} other region{'' if len(staying) == 1 else 's'} {how}"
+
+    def removal_done(self, region: str) -> None:
+        """After the region left, or the removal gave up: if it is still a region, accounts may be homed there again."""
+        if self._leaving == region:
+            self._leaving = None
+
+    def _rehome(self, conn, cur, regions: list[str], *, leaving: str | None = None) -> int:
+        """Spread the accounts over `regions` (homing.rehoming) and return how many moved.
+
+        With Payments running nothing stops. The accounts that are about to move are first taken out of the
+        workers' reach, and no worker is homed in a leaving region any more; a pick and this step exclude each
+        other (_routes), so every transfer that chose one of them earlier is known to be in flight. Those finish
+        (_settle), and only then do the rows change region, in one transaction that no payment can meet. Then the
+        accounts are back in reach at their new home and the workers are dealt over the new regions.
+
+        If the transfers do not finish or the rows do not move, the accounts go back in reach where they were and
+        the error is raised: nothing has changed."""
+        cur.execute("SELECT crdb_region, id FROM accounts")
+        have: dict[str, list[str]] = {}
+        for region, ident in cur.fetchall():
+            have.setdefault(str(region), []).append(str(ident))
+        moves = rehoming(have, regions)
+        moving = {ident for _, _, ids in moves for ident in ids}
+        live = self.running and self.homed
+        before = (self._homes, self.regions, self._dealt)
         try:
-            with conn.cursor() as cur:
-                regions, primary = self._database_regions(cur)
-                if region not in regions or not self._homed_in_database(cur):
-                    return
-                others = [r for r in regions if r != region]
-                if not others:
-                    raise RuntimeError(f"{region} is the only region with Payments accounts; nothing can take them")
-                serving = [r for r in others if r not in self._tie_breakers()] or others
-                target = primary if primary and primary != region else serving[0]
-                self._removing = region
-                self._paused_for_removal = self.running
-                if self.running:
-                    self.stop()
-                cur.execute("UPDATE accounts SET crdb_region = %s WHERE crdb_region = %s", (target, region))
-                cur.execute("TRUNCATE transfers")
-        finally:
-            conn.close()
-        self.regions = [r for r in self.regions if r != region]
-        self._homes.pop(region, None)
-        if self.primary == region:
-            self.primary = target
+            if live:
+                with self._routes:
+                    self._homes = {r: [i for i in ids if i not in moving] for r, ids in self._homes.items() if r != leaving}
+                    self.regions = [r for r in self.regions if r != leaving]
+                    self._dealt = deal(self._dealt, self.regions)
+                self._settle(moving, leaving)
+            if moves:
+                try:
+                    with conn.transaction():
+                        for source, target, ids in moves:
+                            cur.execute("UPDATE accounts SET crdb_region = %s WHERE crdb_region = %s AND id = ANY(%s::UUID[])",
+                                        (target, source, ids))
+                            if cur.rowcount != len(ids):
+                                raise RuntimeError(f"{len(ids)} accounts were to move from {source} to {target}, but "
+                                                   f"{cur.rowcount} did; nothing was moved")
+                except Exception as e:
+                    # A commit that was never answered may have happened. The accounts must end up in reach where
+                    # their rows are, so ask the database: one transaction moved them all, and one account tells.
+                    if not (may_have_committed(e) and self._landed(*moves[0])):
+                        raise
+        except BaseException:
+            if live:
+                with self._routes:
+                    self._homes, self.regions, self._dealt = before
+            raise
+        if self.homed:
+            after = {r: [i for i in have.get(r, ()) if i not in moving] for r in regions}
+            for _, target, ids in moves:
+                after[target].extend(ids)
+            with self._routes:
+                self._homes, self.regions = after, list(regions)
+                self._dealt = deal(self._dealt, self.regions)
+                self._ids = [i for ids in after.values() for i in ids]
+                self._failover = {r: via for r, via in self._failover.items() if r in after}
+        return len(moving)
+
+    def _landed(self, source: str, target: str, ids: list[str]) -> bool:
+        """Whether a move whose commit was not answered took place: is its first account homed in the target now?"""
+        def once() -> bool:
+            conn = self._connect(self._host, statement_timeout="20s")
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT count(*) FROM accounts WHERE crdb_region = %s AND id = %s", (target, ids[0]))
+                    return bool(cur.fetchone()[0])
+            finally:
+                conn.close()
+        try:
+            return retry_with_backoff(once, max_retries=5, initial_backoff=0.5, sleep=self._sleep)
+        except Exception as e:
+            log.warning("could not tell whether accounts moved from %s to %s: %s", source, target, e)
+            return False
+
+    def _settle(self, moving: set[str], leaving: str | None) -> None:
+        """Wait for the transfers already on their way to an account that is about to move, or sent from a region
+        that is leaving (its transfer row is homed there). Normally a fraction of a second."""
+        busy: list = []
+        for _ in range(int(SETTLE_SECONDS / 0.05)):
+            busy = [t for t in list(self._inflight.values())
+                    if (leaving is not None and t[0] == leaving) or t[1] in moving or t[2] in moving]
+            if not busy:
+                return
+            self._sleep(0.05)
+        raise RuntimeError(f"{len(busy)} payments still in flight after {SETTLE_SECONDS:.0f} s; no account was moved")
+
+    @staticmethod
+    def _forget_transfers(cur, region: str) -> None:
+        """Delete the transfer rows homed in a region that is leaving, a batch per statement: the other regions' rows
+        still dedupe retries of live transfers, so the table cannot simply be truncated."""
+        while True:
+            cur.execute("DELETE FROM transfers WHERE crdb_region = %s LIMIT %s", (region, FORGET_BATCH))
+            if cur.rowcount < FORGET_BATCH:
+                return
 
     @staticmethod
     def _homed_in_database(cur) -> bool:
         cur.execute("SELECT table_name, locality FROM [SHOW TABLES] WHERE table_name = 'accounts'")
         return any(str(name) == "accounts" and locality == "REGIONAL BY ROW" for name, locality in cur.fetchall())
-
-    def resume(self, region: str) -> None:
-        """After the region left (or the removal gave up): Payments may start again, and does so on its own
-        when evacuate() paused it; setup spreads the accounts over the regions that remain."""
-        self._removing = None
-        if self._paused_for_removal:
-            self._paused_for_removal = False
-            self.start()
 
     def mark_failure(self, at: float | None = None) -> None:
         if self.running:
@@ -392,10 +550,9 @@ class Workload:
             "last_check": self._last_check, "failure_at": self._failure_at,
             "recovery_s": self._recovery, "recovering": self._failure_at is not None and self._recovery is None,
             "last_error": self._last_error,
-            "paused_for": self._removing,
             "homing": {"on": self.homed, "regions": list(self.regions), "cross_region_pct": self.cross_region_pct,
                        "workers": workers_by_region(self.workers, self.regions) if self.homed and self.regions else {},
-                       "failover": dict(self._failover)},
+                       "failover": dict(self._failover), "leaving": self._leaving},
             "by_home": w["by_home"], "cross_region": w["cross_region"],
             "history": [{"ts": h["ts"], "commits": h["commits"], "retries": h["retries"], "errors": h["errors"],
                          "regions": h["regions"]} for h in history[-HISTORY_SECONDS:]],
@@ -433,7 +590,7 @@ class Workload:
                                 (home, tid, a, b, amount))
                     cur.execute("UPDATE accounts SET balance = balance - %s WHERE crdb_region = %s AND id = %s",
                                 (amount, a_home, a))
-                    if cur.rowcount != 1:  # the account moved to another region (an evacuation): roll back
+                    if cur.rowcount != 1:  # the account is homed elsewhere now: roll back (_rehome never lets this happen)
                         raise RuntimeError(f"account {a} has moved out of {a_home}")
                     cur.execute("UPDATE accounts SET balance = balance + %s WHERE crdb_region = %s AND id = %s",
                                 (amount, b_home, b))
@@ -467,9 +624,12 @@ class Workload:
             return conn, region
         raise last or ConnectionError(f"no usable node to serve {home}")
 
-    def _pick(self, rng: random.Random, home: str) -> tuple[str, str, str, str]:
-        """(source, its region, destination, its region): both at home, except for the cross-region share."""
-        mine = self._homes[home]
+    def _pick(self, rng: random.Random, home: str) -> tuple[str, str, str, str] | None:
+        """(source, its region, destination, its region): both at home, except for the cross-region share.
+        None when no account of the region is in reach (for a moment, while they change region)."""
+        mine = self._homes.get(home)
+        if not mine:
+            return None
         a = rng.choice(mine)
         others = [r for r in self.regions if r != home and self._homes.get(r)]
         if others and rng.random() < self.cross_region_pct / 100:
@@ -537,10 +697,41 @@ class Workload:
         self.stats.fail()
         return kind
 
+    def _next(self, index: int, rng: random.Random) -> tuple[str, str, str, str, str] | None:
+        """Choose worker `index`'s next transfer and mark it in flight: (the worker's home, source, its region,
+        destination, its region). The home is the region the worker is dealt now: it can change when a region
+        joins or leaves. One step with the choice, so a re-homing sees every transfer that chose before it
+        (_rehome)."""
+        with self._routes:
+            if len(self._dealt) != self.workers:  # the worker count changed since the last deal
+                self._dealt = deal([None] * self.workers, self.regions)
+            home = self._dealt[index]
+            pick = self._pick(rng, home)
+            if pick is None:
+                return None
+            self._inflight[index] = (home, pick[0], pick[2])
+            return (home, *pick)
+
+    def _turn(self, index: int, state: dict, rng: random.Random) -> str | None:
+        """One transfer by worker `index`; None when its region has no account in reach right now."""
+        if not (self.homed and self.regions):
+            a, b = rng.sample(self._ids, 2)
+            return self._send(state, a, b, rng.randint(1, 100), rng)
+        chosen = self._next(index, rng)
+        if chosen is None:
+            return None
+        try:
+            home, a, a_home, b, b_home = chosen
+            if home != state.get("home"):  # its customers live elsewhere now: connect where they are
+                self._close(state)
+                state["home"] = home
+            return self._send(state, a, b, rng.randint(1, 100), rng, a_home=a_home, b_home=b_home)
+        finally:
+            self._inflight.pop(index, None)
+
     def _worker(self, index: int) -> None:
         rng = random.Random(index * 7919 + int(self._clock()))
-        home = home_of(index, self.regions) if self.homed and self.regions else None
-        state: dict = {"conn": None, "home": home, "rng": rng}
+        state: dict = {"conn": None, "home": None, "rng": rng}
         interval = self.workers / self.rate
         next_at = self._clock() + rng.random() * interval
         while not self._stop.is_set():
@@ -550,12 +741,7 @@ class Workload:
             if delay > 0 and self._stop.wait(delay):
                 break
             next_at = max(next_at + interval, self._clock() - interval)
-            if home is None:
-                a, b = rng.sample(self._ids, 2)
-                self._send(state, a, b, rng.randint(1, 100), rng)
-            else:
-                a, a_home, b, b_home = self._pick(rng, home)
-                self._send(state, a, b, rng.randint(1, 100), rng, a_home=a_home, b_home=b_home)
+            self._turn(index, state, rng)
         self._close(state)
 
     def _checker(self) -> None:

@@ -639,3 +639,63 @@ def test_default_placement_is_three_copies_at_home_plus_one_read_only_copy_per_o
     assert not _default_placed("us-east-1", ["us-east-1"] * 3 + ["eu-west-1"], regions)
     assert _where("eu-west-1", ["eu-west-1"] * 3 + ["ap-southeast-1"] * 2) == "3 in eu-west-1, 2 outside"
     assert _where("eu-west-1", ["eu-west-1"] * 3) == "3 in eu-west-1, none outside"
+
+
+# -- elastic scale: what the steps say about Payments is what Payments did --
+
+class HomedPayments:
+    """Payments as the Elastic scale steps see it: which regions it homes customers in, and whether it runs."""
+    def __init__(self, regions, running=True):
+        self.regions, self.running = list(regions), running
+
+    def status(self):
+        return {"running": self.running, "homing": {"on": True, "regions": list(self.regions)}}
+
+
+def elastic_ctx(payments, change):
+    """A context whose elastic change does `change(payments)` when a region is added or removed."""
+    elastic = SimpleNamespace(add_region=lambda *a, **k: change(payments), remove_region=lambda *a, **k: change(payments))
+    ctx = ctx_for(AWS9, elastic=elastic, workload=payments)
+    ctx.wait_operation = lambda *a, **k: None
+    return ctx
+
+
+def test_adding_a_region_reports_that_payments_serve_it_only_when_they_do():
+    from controlplane.scenarios import library as L
+    state = {"new_region": "ap-northeast-1", "provider": "aws"}
+    took_it = elastic_ctx(HomedPayments(["us-east-1"]), lambda p: p.regions.append("ap-northeast-1"))
+    assert L._add_region(took_it, state) == {"New region": "ap-northeast-1", "Nodes": 3, "Payments": "now serve customers there"}
+    left_alone = elastic_ctx(HomedPayments(["us-east-1"], running=False), lambda p: None)  # stopped: nothing moves
+    assert L._add_region(left_alone, state) == {"New region": "ap-northeast-1", "Nodes": 3}
+
+
+def test_removing_a_region_reports_that_payments_kept_running_only_when_they_did():
+    from controlplane.scenarios import library as L
+    state = {"new_region": "ap-northeast-1"}
+    moved = elastic_ctx(HomedPayments(["us-east-1", "ap-northeast-1"]), lambda p: p.regions.remove("ap-northeast-1"))
+    assert L._remove_region(moved, state) == {"Removed": "ap-northeast-1", "Payments": "kept running: its customers moved first"}
+    nothing_there = elastic_ctx(HomedPayments(["us-east-1"]), lambda p: None)
+    assert L._remove_region(nothing_there, state) == {"Removed": "ap-northeast-1"}
+    stopped = HomedPayments(["us-east-1", "ap-northeast-1"], running=False)
+    assert L._remove_region(elastic_ctx(stopped, lambda p: p.regions.remove("ap-northeast-1")), state) == {"Removed": "ap-northeast-1"}
+
+
+def test_the_elastic_steps_work_with_a_workload_that_reports_no_homing():
+    from controlplane.scenarios import library as L
+    ctx = ctx_for(AWS9, elastic=FakeElastic(SimpleNamespace(topology=AWS9)), workload=FakeWorkload())
+    ctx.wait_operation = lambda *a, **k: None
+    assert L._add_region(ctx, {"new_region": "ap-northeast-1", "provider": "aws"}) == {"New region": "ap-northeast-1", "Nodes": 3}
+    assert L._remove_region(ctx, {"new_region": "ap-northeast-1"}) == {"Removed": "ap-northeast-1"}
+
+
+def test_the_elastic_steps_wait_as_long_as_a_drain_under_load_takes():
+    """With Payments running, a region's replicas took 866 s to leave in a trial and longer while a video was being
+    recorded. The default 15 minutes failed the step although the removal went on to finish."""
+    from controlplane.scenarios import library as L
+    waits = []
+    ctx = elastic_ctx(HomedPayments(["us-east-1"]), lambda p: None)
+    ctx.elastic.decommission = lambda *a, **k: None
+    ctx.wait_operation = lambda timeout=900: waits.append(timeout)
+    L._remove_region(ctx, {"new_region": "ap-northeast-1"})
+    L._decommission(ctx, {"added_node": "us-east-1a-n4"})
+    assert len(waits) == 2 and all(seconds >= 1800 for seconds in waits)
