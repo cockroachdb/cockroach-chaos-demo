@@ -1,0 +1,61 @@
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	# The stage keeps one never-ending event stream open, and an inspecting web
+	# gateway of the kind staff laptops sit behind holds a never-ending response
+	# back whole, so the stage sat at "Connecting..." for good. The stream is
+	# answered in complete pieces instead: one event, and a request to come
+	# back in a second, which the browser's EventSource does by itself.
+	@feed path /api/events
+	handle @feed {
+		header Content-Type text/event-stream
+		header Cache-Control no-cache
+		templates {
+			mime text/event-stream
+		}
+		respond `retry: 1000
+{{httpInclude "/api/events/once"}}`
+	}
+
+	handle /api/events/once {
+		rewrite * /api/events?once=true
+		reverse_proxy ${upstream}
+	}
+
+	# The panel reports its own addresses as localhost with a port each, and
+	# the presenter turns them into links by swapping in the page's hostname.
+	# A run.app address has no ports to offer: the DB Console and the load
+	# balancer's stats are services of their own here, so the answer is
+	# corrected on the way out. The stage and presenter become plain paths.
+	@system path /api/system
+	handle @system {
+		header Content-Type application/json
+		templates {
+			mime application/json
+		}
+		respond `{{httpInclude "/api/system/raw" | replace "http://localhost:8080" "${console_url}" | replace "http://localhost:8404" "${lb_url}" | replace "http://localhost:8088" ""}}`
+	}
+
+	handle /api/system/raw {
+		rewrite * /api/system
+		reverse_proxy ${upstream}
+	}
+
+	handle {
+		reverse_proxy ${upstream}
+	}
+
+	# EventSource takes an error status as final and stops asking, which would
+	# leave the stage frozen after the VM restarts. Tell it to keep asking.
+	handle_errors {
+		handle @feed {
+			header Content-Type text/event-stream
+			respond `retry: 2000
+
+` 200
+		}
+	}
+}

@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars, which git ignores, and fill in.
+
+# The GCP project everything is created in.
+project_id = "your-gcp-project"
+
+# Everyone with a Google account in this domain gets through the sign-in.
+staff_domain = "example.com"
+
+# Optional. Without a license CockroachDB throttles the cluster 7 days after it is built.
+crdb_license = ""
+
+# Optional. Banko's model provider, as the environment variables Banko reads.
+# Left out, Banko's pages work and its assistant does not.
+# banko_env = {
+#   AI_SERVICE     = "openai"
+#   OPENAI_API_KEY = "..."
+# }
