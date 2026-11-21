@@ -26,13 +26,36 @@ demo_commit="$(git -C ../.. log -1 --format=%H "$demo_ref" -- "${demo_files[@]}"
 [ "$(demo_id "$demo_commit")" = "$(demo_id "$demo_ref")" ] || demo_commit="$demo_ref"
 
 mkdir -p .build
+
+# An install can hold an explainer the repository does not. Files in
+# web/explainers that git does not track, and that .gitignore does not name,
+# ride along: they are packed as a commit nothing refers to, made of the tree
+# and the date of the one above, so the archive still only changes when what
+# it holds does.
+own_explainers() {
+  git -C ../.. ls-files --others --exclude-per-directory=.gitignore "$@" -- web/explainers
+}
+own="$(own_explainers | wc -l | tr -d ' ')"
+if [ "$own" -gt 0 ]; then
+  echo "tf.sh: packing $own explainer file(s) that are not in git" >&2
+  index="$PWD/.build/index"
+  rm -f "$index"
+  GIT_INDEX_FILE="$index" git -C ../.. read-tree "$demo_commit"
+  own_explainers -z | GIT_INDEX_FILE="$index" git -C ../.. update-index --add -z --stdin
+  tree="$(GIT_INDEX_FILE="$index" git -C ../.. write-tree)"
+  when="$(git -C ../.. log -1 --format=%cI "$demo_commit")"
+  demo_commit="$(GIT_AUTHOR_NAME=tf.sh GIT_AUTHOR_EMAIL=tf.sh@localhost GIT_AUTHOR_DATE="$when" \
+    GIT_COMMITTER_NAME=tf.sh GIT_COMMITTER_EMAIL=tf.sh@localhost GIT_COMMITTER_DATE="$when" \
+    git -C ../.. commit-tree "$tree" -m "The demo with this install's own explainers")"
+fi
+
 git -C ../.. archive --format=tar.gz -o "$PWD/.build/demo.tar.gz" "$demo_commit" -- "${demo_files[@]}"
 git -C "$banko_dir" archive --format=tar.gz -o "$PWD/.build/banko.tar.gz" "$banko_ref"
 
 # Terraform replaces the VM when what an archive holds changes, and these say
 # what that is. Unlike an archive's own bytes they are the same on every
 # machine.
-demo_id "$demo_ref" > .build/demo.id
+demo_id "$demo_commit" > .build/demo.id
 git -C "$banko_dir" rev-parse "$banko_ref^{tree}" > .build/banko.id
 
 # init has to be told which bucket holds the state. backend.hcl names it.

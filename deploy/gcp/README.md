@@ -122,6 +122,10 @@ Use `./tf.sh` wherever you would type `terraform`. It packs the demo as committe
     ./tf.sh init
     ./tf.sh apply
 
+An explainer of your own rides along. Files in `web/explainers` that git does not track, and that
+`.gitignore` does not name, are packed with the demo, so the hosted stage can show an explainer the
+repository does not hold. `tf.sh` says so when it packs any.
+
 The VM then installs Docker, unpacks the archive, builds the cluster and adds nodes until every
 region has `nodes_per_region`, which takes about two minutes. Banko follows, about seven minutes to
 build its image and seed its personas, and then its pipeline, about two more. Payments are left
@@ -157,7 +161,9 @@ Each address asks for the Google sign-in once per browser. A shell on the VM: `.
 A change to either code base, the CockroachDB version, the preset, the node count, the license,
 Banko's provider or the startup script replaces the VM, because nothing else would rerun the script.
 A commit that leaves the packed files alone is not a change: the VM is tied to what the archives
-hold, not to the commit they came from or the machine that packed them.
+hold, not to the commit they came from or the machine that packed them. Explainers of your own are
+part of what the demo's archive holds, so a machine that lacks them plans a new VM without them:
+copy them there first.
 That takes about ten minutes with Banko and rebuilds the cluster from scratch, so whatever a
 presenter had set up on it is gone.
 
