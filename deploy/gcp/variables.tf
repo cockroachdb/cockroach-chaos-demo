@@ -44,6 +44,12 @@ variable "staff_domain" {
   type        = string
 }
 
+variable "banko_sign_in" {
+  description = "Sign each person in to Banko as themselves, from the Google identity the sign-in in front has already checked, with the personas a click away. Off leaves Banko's own username page, where anyone can be anyone."
+  type        = bool
+  default     = true
+}
+
 variable "banko_env" {
   description = "Banko's model provider, as the environment variables Banko reads: AI_SERVICE and that provider's credentials. Empty runs Banko with no model, so its pages work and its assistant does not."
   type        = map(string)

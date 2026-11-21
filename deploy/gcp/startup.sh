@@ -127,11 +127,17 @@ start_banko() {
   fi
   docker build -t banko:local "$BANKO_DIR/src"
 
-  # Turns on the coach's webhook, and with it the welcome nudge a new sign-up
-  # gets. Banko signs that post itself and nothing outside the VM can reach
-  # the webhook, so the secret is made here and never leaves.
+  # Turns on the coach's signed webhook, which Banko's own checks post to.
+  # Nothing outside the VM can reach it, so the secret is made here and never
+  # leaves.
   local webhook_secret
   webhook_secret="$(openssl rand -hex 32)"
+
+  # Behind the sign-in in front, Banko signs each person in as who Google
+  # says they are, once it is told which service that sign-in vouches for.
+  # "off" leaves its username page, where anyone can be anyone.
+  local iap_audience
+  iap_audience="$(attr banko-iap-audience)"
 
   (
     umask 077
@@ -148,6 +154,7 @@ start_banko() {
       echo "COACH_KAFKA_ENABLED=true"
       echo "KAFKA_BOOTSTRAP_SERVERS=kafka:9092"
       echo "SESSION_COOKIE_SECURE=true"
+      [ "$iap_audience" = off ] || echo "IAP_AUDIENCE=$iap_audience"
       echo "OMP_NUM_THREADS=2"
       attr banko-env
       echo
@@ -170,30 +177,11 @@ start_banko() {
 
 # Banko's own pipeline: a changefeed on its signals table into Kafka, and
 # Debezium routing that to the topic the coach reads. Banko's script brings it
-# up, and so that the changefeed can find Kafka it joins every node to the
-# pipeline's network. A node on two networks is not what the stage is built
-# for: it used to come back from a restart with latency shaped on the wrong
-# one. So Kafka joins the demo's network instead, under the name the
-# changefeed already uses, and the nodes are taken back off.
+# up and puts Kafka on the demo's network under the name the changefeed uses,
+# so no node joins a second network, which the stage is not built for.
 start_pipeline() {
   command -v unzip > /dev/null || apt-get install -y unzip
   "$BANKO_DIR/src/scripts/coach/cdc-demo/run-cdc-demo.sh"
-
-  local members
-  members="$(docker network inspect crdb-chaos --format '{{range .Containers}}{{.Name}} {{end}}')"
-  case " $members " in
-    *" banko-cdc-kafka "*) ;;
-    *) docker network connect --alias kafka crdb-chaos banko-cdc-kafka ;;
-  esac
-
-  local member
-  members="$(docker network inspect cdc-demo_default --format '{{range .Containers}}{{.Name}} {{end}}')"
-  for member in $members; do
-    case "$member" in
-      banko-cdc-*) ;;
-      *) docker network disconnect cdc-demo_default "$member" ;;
-    esac
-  done
 }
 
 # Latency between regions is shaped with netem. Without the module the stack

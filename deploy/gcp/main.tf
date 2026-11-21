@@ -47,10 +47,19 @@ locals {
   # ports on localhost; a run.app address has no ports to offer, so each gets
   # a proxy and a sign-in of its own.
   extras = {
-    console = { name = "${local.name}-console", port = 8080, change_host = false } # the DB Console, through HAProxy to whichever node is up
-    lb      = { name = "${local.name}-lb", port = 8404, change_host = false }      # HAProxy's stats, at /stats
-    banko   = { name = "banko-demo", port = 5000, change_host = true }             # Banko, banking on the same cluster
+    console = { name = "${local.name}-console", port = 8080 } # the DB Console, through HAProxy to whichever node is up
+    lb      = { name = "${local.name}-lb", port = 8404 }      # HAProxy's stats, at /stats
+    banko   = { name = "banko-demo", port = 5000 }            # Banko, banking on the same cluster
   }
+}
+
+# The sign-in in front of Banko signs who each visitor is into every request,
+# and names the service it signed for. This is that name, which Banko checks
+# before it believes the rest. "off" leaves Banko's own username page.
+data "google_project" "this" {}
+
+locals {
+  banko_iap_audience = var.banko_sign_in ? "/projects/${data.google_project.this.number}/locations/${var.region}/services/${local.extras.banko.name}" : "off"
 }
 
 resource "google_project_service" "this" {
@@ -244,6 +253,10 @@ resource "google_compute_instance" "this" {
     banko-archive    = "gs://${google_storage_bucket.demo.name}/${google_storage_bucket_object.banko.name}"
     banko-secret-key = random_password.banko_secret_key.result
     banko-env        = join("\n", [for k, v in var.banko_env : "${k}=${v}"])
+
+    # Not among the startup inputs above: turning Banko's sign-in on or off is
+    # no reason for a new cluster. The README says how it is applied.
+    banko-iap-audience = local.banko_iap_audience
   }
 
   metadata_startup_script = file("${path.module}/startup.sh")
@@ -322,13 +335,8 @@ resource "google_cloud_run_v2_service" "stage" {
 
 # Plain pass-throughs: none of these pages holds a stream open for good. The
 # proxy sees plain HTTP from Google's front end and would tell the upstream
-# so; Banko checks its Socket.IO origin against that, so it is told the truth.
-#
-# Banko also posts a new sign-up's welcome nudge to itself, at whatever host
-# the sign-up request named. Named as the public address, that post stops at
-# the sign-in and the nudge never arrives, so Banko's proxy names the VM's own
-# address as the host. The public one still travels in X-Forwarded-Host, which
-# the Socket.IO check reads.
+# so; Banko checks where a request came from against that, so it is told the
+# truth.
 resource "google_cloud_run_v2_service" "extra" {
   for_each = local.extras
 
@@ -348,12 +356,12 @@ resource "google_cloud_run_v2_service" "extra" {
     containers {
       image   = "docker.io/library/caddy:2-alpine"
       command = ["caddy"]
-      args = concat([
+      args = [
         "reverse-proxy",
         "--from", ":8080",
         "--to", "http://${local.vm_ip}:${each.value.port}",
         "--header-up", "X-Forwarded-Proto: https",
-      ], each.value.change_host ? ["--change-host-header"] : [])
+      ]
 
       ports {
         container_port = 8080

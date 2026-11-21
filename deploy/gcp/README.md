@@ -57,12 +57,14 @@ about a quarter of the CPU idle; payments plus Banko's load simulator at 100 cus
 operations a second leave about a tenth, with both still at full rate and no errors. Driving both
 hard at once is where `t2d-standard-16` starts to earn its cost.
 
+Behind the sign-in, Banko signs each person in as themselves. It reads the identity Google's proxy
+signs into every request, checks the signature, and gives that Google account a Banko account of
+its own on the first visit. The personas maya, sam and riley are a click away, under "View as".
+That is `banko_sign_in`, on unless you turn it off; off, Banko asks for a username and takes
+anyone's word for it.
+
 The Coach page works as it does on a laptop: its simulated signals go to the real coach agent, and
-a new sign-up gets a welcome nudge. That nudge is why Banko's proxy differs from the other two.
-Banko posts it to itself at whatever host the sign-up request named, and the public address is the
-sign-in, where the post is lost. So the proxy names the VM's own address as the host
-(`--change-host-header`) and the public one travels in `X-Forwarded-Host`. The webhook's secret is
-made on the VM at each boot.
+a new account gets a welcome nudge.
 
 Banko's Kafka pipeline runs beside it: a changefeed on `spending_signals` into Kafka, and Debezium
 routing that to the topic the coach reads. Banko's own `scripts/coach/cdc-demo/run-cdc-demo.sh`
@@ -76,12 +78,9 @@ seconds later. Nothing outside the VM reaches SQL, so that is a demo for whoever
             'demo:' || gen_random_uuid()::STRING);
     SQL
 
-One thing is done differently from that script. It joins every node to the pipeline's network so
-that the changefeed can find Kafka, and a node on two networks is not what the stage is built for:
-it used to come back from a restart with the latency shaped on the wrong interface. Here Kafka joins
-the demo's network under the same name instead, and the nodes are taken back off. The pipeline kept
-delivering through a region outage, and picked up by itself after the whole cluster went down and
-came back.
+The script puts Kafka on the demo's network under the name the changefeed uses, so no node joins a
+second network, which the stage is not built for. The pipeline kept delivering through a region
+outage, and picked up by itself after the whole cluster went down and came back.
 
 Three things to know. The stage cannot rebuild the cluster here. A rebuild wipes `defaultdb`: Banko
 then needs a restart, and the pipeline's changefeed is gone with the old cluster until the VM is
@@ -138,7 +137,7 @@ every ten minutes. Watch the startup with:
     ./tf.sh output stage_url       # the stage; add /presenter for the console
     ./tf.sh output console_url     # the DB Console
     ./tf.sh output lb_stats_url    # HAProxy's stats
-    ./tf.sh output banko_url       # Banko; sign in as maya, sam or riley
+    ./tf.sh output banko_url       # Banko; you are yourself, the personas are under "View as"
 
 Each address asks for the Google sign-in once per browser. A shell on the VM: `./tf.sh output ssh`.
 
@@ -151,6 +150,9 @@ Each address asks for the Google sign-in once per browser. A shell on the VM: `.
   Without one CockroachDB throttles the cluster 7 days after it was built.
 - **Who gets in:** `staff_domain`, or change the member on `google_iap_web_cloud_run_service_iam_member`
   to a Google group.
+- **Banko's sign-in:** `banko_sign_in = false` in `terraform.tfvars` brings back the username page.
+  This one does not replace the VM: apply, then run `sudo google_metadata_script_runner startup` on
+  the VM, which starts Banko again with the new setting and leaves the cluster alone.
 
 A change to either code base, the CockroachDB version, the preset, the node count, the license,
 Banko's provider or the startup script replaces the VM, because nothing else would rerun the script.
