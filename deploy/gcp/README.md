@@ -11,8 +11,9 @@ Workspace domain opens after signing in with Google.
                                     -> Cloud Run proxy -> VM :5000 (Banko)
 
 The sign-in is the only gate. There is no `CONTROL_TOKEN` behind it, so whoever is signed in can
-drive the stage, open `/presenter` and run scenarios, and can equally rebuild or break the one
-cluster everybody shares. SQL stays inside the VM's network.
+drive the stage, open `/presenter` and run scenarios, and can equally break the one cluster
+everybody shares. One thing is switched off: rebuilding it (`REBUILD=off`), because a rebuild wipes
+every database on it. SQL stays inside the VM's network.
 
 On a laptop the DB Console and the load balancer's stats are ports on localhost, and the presenter
 links to them by putting the page's hostname in front of the port. A `run.app` address answers on
@@ -76,15 +77,16 @@ seconds later. Nothing outside the VM reaches SQL, so that is a demo for whoever
     SQL
 
 One thing is done differently from that script. It joins every node to the pipeline's network so
-that the changefeed can find Kafka, and a node on two networks comes back from a restart with them
-in the other order, which puts the stage's latency shaping on the wrong interface. Here Kafka joins
+that the changefeed can find Kafka, and a node on two networks is not what the stage is built for:
+it used to come back from a restart with the latency shaped on the wrong interface. Here Kafka joins
 the demo's network under the same name instead, and the nodes are taken back off. The pipeline kept
 delivering through a region outage, and picked up by itself after the whole cluster went down and
 came back.
 
-Three things to know. Rebuilding the cluster from the stage with another preset wipes `defaultdb`:
-Banko then needs a restart (`docker restart banko` on the VM), and the pipeline's changefeed is gone
-with the old cluster until the VM is replaced. Banko streams each answer as it is written; through
+Three things to know. The stage cannot rebuild the cluster here. A rebuild wipes `defaultdb`: Banko
+then needs a restart, and the pipeline's changefeed is gone with the old cluster until the VM is
+replaced. So the VM's `.env` says `REBUILD=off`, the presenter does not offer a rebuild, and a new
+cluster comes with a new VM. Banko streams each answer as it is written; through
 that gateway a staff browser gets the answer whole when it is finished. And nothing outside the VM
 can post to the coach's webhook, which sits behind the sign-in like everything else.
 
@@ -104,7 +106,12 @@ The state lives in that bucket, which has to exist before the first init:
     gcloud storage buckets update gs://$PROJECT-tfstate --versioning
 
 On another machine the same two files and `./tf.sh init` pick up where the last one left off: the
-state is in the bucket, not on a laptop.
+state is in the bucket, not on a laptop. The two files can live there too, beside the state, where
+only those who can already read the state can read them:
+
+    gcloud storage cp terraform.tfvars backend.hcl gs://$PROJECT-tfstate/chaos-demo-config/
+
+The same command the other way round brings them back. Copy them again after changing either.
 
 ## Apply
 
@@ -120,9 +127,8 @@ The VM then installs Docker, unpacks the archive, builds the cluster and adds no
 region has `nodes_per_region`, which takes about two minutes. Banko follows, about seven minutes to
 build its image and seed its personas, and then its pipeline, about two more. Payments are left
 off, as on a laptop: whoever presents starts them from the stage, and should stop them afterwards.
-Left running at 250 a second they add over a gigabyte an hour to a 99 GB disk: their rows are set
-to expire after an hour, but CockroachDB runs that expiry once a day unless a table says otherwise.
-Watch the startup with:
+Left running they hold about an hour of transfers: the rows expire after an hour and are deleted
+every ten minutes. Watch the startup with:
 
     gcloud compute instances get-serial-port-output chaos-demo --zone us-east1-b --project $PROJECT \
       | grep startup-script

@@ -4,8 +4,7 @@
 # Banko beside it, with its pipeline. Safe to run again.
 #
 # Payments are left off, as they are on a laptop: whoever presents starts
-# them from the stage. Left running they add over a gigabyte an hour to the
-# disk, because their rows expire once a day and not once an hour.
+# them from the stage.
 set -euo pipefail
 
 # The startup-script runner sets no HOME, and docker and gcloud both want one.
@@ -45,6 +44,10 @@ unpack() {
 
 # No CONTROL_TOKEN: the sign-in in front is the gate, and behind it the stage
 # is meant to be driven by whoever is presenting, as it is on a laptop.
+#
+# One thing is switched off: rebuilding the cluster. Everybody shares it and
+# Banko banks on it, and a rebuild wipes every database: Banko's goes, and its
+# pipeline's changefeed with it. A new cluster comes with a new VM.
 write_env() {
   local license
   license="$(attr crdb-license)"
@@ -55,6 +58,7 @@ write_env() {
       echo "PRESET=$(attr preset)"
       echo "CRDB_VERSION=$(attr crdb-version)"
       [ -z "$license" ] || echo "CRDB_LICENSE=$license"
+      echo "REBUILD=off"
     } > "$DIR/.env"
   )
 }
@@ -167,10 +171,10 @@ start_banko() {
 # Banko's own pipeline: a changefeed on its signals table into Kafka, and
 # Debezium routing that to the topic the coach reads. Banko's script brings it
 # up, and so that the changefeed can find Kafka it joins every node to the
-# pipeline's network. A node on two networks comes back from a restart with
-# them in the other order, and the stage then shapes latency on the wrong one.
-# So Kafka joins the demo's network instead, under the name the changefeed
-# already uses, and the nodes are taken back off.
+# pipeline's network. A node on two networks is not what the stage is built
+# for: it used to come back from a restart with latency shaped on the wrong
+# one. So Kafka joins the demo's network instead, under the name the
+# changefeed already uses, and the nodes are taken back off.
 start_pipeline() {
   command -v unzip > /dev/null || apt-get install -y unzip
   "$BANKO_DIR/src/scripts/coach/cdc-demo/run-cdc-demo.sh"

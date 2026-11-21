@@ -207,8 +207,32 @@ def payments_through_region_changes(ev: dict, region: str = "ap-northeast-1") ->
         api("POST", "/api/workload/stop")
 
 
+def payments_tables_stay_small(ev: dict) -> None:
+    """Payments left on must not fill the disk. Transfer rows expire after an hour; the job that deletes them runs
+    every ten minutes and may delete twice what Payments insert; both tables keep ten minutes of old versions. The
+    control plane applies these as housekeeping and carries on when a statement is refused, so a refusal shows here
+    or nowhere."""
+    w = state()["workload"]
+    check(w["running"], "payments are not running")
+    nodes = len(w["homing"]["regions"]) if w["homing"]["on"] else 1  # the nodes that delete: one per home region
+    limit = max(100, -(-2 * w["rate"] // nodes))
+    create = sql("SHOW CREATE TABLE chaos.public.transfers", one=True)[1]
+    table_id = sql("SELECT 'chaos.public.transfers'::REGCLASS::OID::INT", one=True)[0]
+    schedule = sql(f"SELECT recurrence, schedule_status FROM [SHOW SCHEDULES] WHERE label = 'row-level-ttl: transfers [{table_id}]'")
+    kept = {t: sql(f"SHOW ZONE CONFIGURATION FROM TABLE chaos.public.{t}", one=True)[1] for t in ("accounts", "transfers")}
+    ev.update({"transfers": create[create.rindex("WITH ("):].split(")")[0] + ")", "expiry schedule": schedule,
+               "delete limit": f"{limit} rows/s on each of {nodes} node(s), for {w['rate']} payments/s",
+               "old versions kept": {t: next((x.strip().rstrip(",") for x in c.splitlines() if "gc.ttlseconds" in x), None) for t, c in kept.items()}})
+    check("ttl_expire_after = '01:00:00'" in create, "transfer rows do not expire after an hour")
+    check("ttl_job_cron = '*/10 * * * *'" in create, "the expiry job is not set to every ten minutes")
+    check(schedule == [("*/10 * * * *", "ACTIVE")], f"the expiry schedule is {schedule}")
+    check(f"ttl_delete_rate_limit = {limit}," in create, f"the expiry job may not delete {limit} rows a second per node")
+    check(all("gc.ttlseconds = 600" in c for c in kept.values()), "a Payments table keeps old versions longer than ten minutes")
+
+
 def tc(name: str) -> str:
-    return sh(CLI, "run", "--rm", "--network", f"container:{name}", "--entrypoint", "tc", HELPER, "qdisc", "show", "dev", "eth0")
+    """A node's shaping, on whichever interface carries it: the demo's network is not eth0 on every node."""
+    return sh(CLI, "run", "--rm", "--network", f"container:{name}", "--entrypoint", "tc", HELPER, "qdisc", "show")
 
 
 RTT_PY = """
@@ -239,6 +263,40 @@ def compose(env_extra: dict):
     sh(*dc, "up", "-d", "control-plane", env=env, timeout=600)
     wait_for(lambda: api("GET", "/api/state")[0] == 200 and (state().get("operation") or {}).get("status") != "running",
              240, "the control plane to come back")
+
+
+def rebuild_switch(ev: dict, p) -> None:
+    """REBUILD=off, for a cluster other people use: the panel refuses a rebuild and the presenter does not offer one.
+    Everything else stays open, and the default comes back afterwards. The panel answers before its first snapshot
+    after a restart, so each restart here waits for the cluster to be reported again."""
+    nodes = healthy()["cluster"]["total_nodes"]
+    compose({"REBUILD": "off", "DEPLOYMENT_MODEL": "multi-region"})
+    try:
+        healthy(nodes)
+        code, body = api("POST", "/api/cluster/rebuild", {"preset": "gcp"})
+        ev["a rebuild asked for"] = f"{code}: {body.get('detail') if isinstance(body, dict) else body}"
+        ev["the presenter is told rebuild is on"] = api("GET", "/api/system")[1].get("rebuild")
+        r = browser(p, [
+            {"do": "open", "url": f"{PANEL}/presenter", "settle": 5000},
+            {"do": "eval", "as": "offered", "expr": "[...document.querySelectorAll('#presets button')].filter((b) => b.textContent === 'Rebuild with this').length"},
+            {"do": "eval", "as": "presets", "expr": "document.querySelectorAll('#presets .preset').length"},
+            {"do": "eval", "as": "hint", "expr": "document.getElementById('rebuild-hint').textContent"},
+            {"do": "eval", "as": "custom", "expr": "document.getElementById('preset-rebuild').disabled"},
+            {"do": "eval", "as": "model", "expr": "getComputedStyle(document.getElementById('model-row')).display"},
+            {"do": "shot", "file": p.shot("rebuild-off")},
+        ])
+        ev.update({"rebuild buttons on the presenter": r["offered"], "presets still listed": r["presets"],
+                   "the presenter says": r["hint"], "presenter": p.shot("rebuild-off")})
+        ev["another change"] = api("POST", "/api/cluster/latency", {"setting": "realistic"})[0]
+        ev["nodes before and after"] = f"{nodes} and {healthy(nodes)['cluster']['total_nodes']}"
+    finally:
+        compose({"REBUILD": "on", "DEPLOYMENT_MODEL": "multi-region"})
+    after = healthy(nodes)["cluster"]
+    check(code == 403 and ev["the presenter is told rebuild is on"] is False, "the API did not refuse the rebuild")
+    check(r["offered"] == 0 and r["presets"] > 0 and r["custom"] is True and r["model"] == "none" and "switched off" in r["hint"],
+          "the presenter still offers a rebuild, or does not say why it does not")
+    check(ev["another change"] == 200 and after["total_nodes"] == nodes, "something other than a rebuild was refused, or the cluster changed")
+    check(api("GET", "/api/system")[1].get("rebuild") is True, "rebuild did not come back on")
 
 
 # -- report --------------------------------------------------------------------------------------------------------
@@ -392,8 +450,8 @@ def main() -> int:
 
     check(api("GET", "/api/state")[0] == 200, "the control plane isn't answering: run ./run.sh up first")
     p.meta = {"mode": "quick" if args.quick else "full", "runtime": CLI,
-              "cockroach": sh(CLI, "image", "inspect", "--format", "{{index .RepoTags 0}}", "docker.io/cockroachdb/cockroach:v26.3.2",
-                              check_rc=False).strip() or "v26.3.2",
+              "cockroach": sh(CLI, "image", "inspect", "--format", "{{index .RepoTags 0}}", "docker.io/cockroachdb/cockroach:v26.4.1",
+                              check_rc=False).strip() or "v26.4.1",
               "node": sh("node", "--version").strip(), "started": time.strftime("%Y-%m-%d %H:%M")}
 
     # ---- environment ----
@@ -510,7 +568,7 @@ def main() -> int:
     from controlplane.netem import rtt_ms
     from controlplane.topology import load_preset
     catalog = load_catalog(ROOT / "catalog" / "regions.yaml")
-    aws = load_preset(ROOT / "presets", "aws", catalog, default_version="v26.3.2", subnet="10.77.0.0/16", max_nodes=15)
+    aws = load_preset(ROOT / "presets", "aws", catalog, default_version="v26.4.1", subnet="10.77.0.0/16", max_nodes=15)
     reg = {r.name: r for r in aws.regions}
 
     def latency(ev):
@@ -672,6 +730,8 @@ def main() -> int:
                    "cluster p50/p95/p99": f"{t['p50_ms']} / {t['p95_ms']} / {t['p99_ms']} ms"})
         check(w["money_lost"] == 0 and t["p95_ms"] is not None, "payments or latency percentiles missing")
     p.run("Payments run with the $10,000,000 invariant and p50/p95/p99", payments)
+    p.run("Payments tables stay small: transfers expire every ten minutes, old versions go after ten",
+          payments_tables_stay_small)
 
     def home_chips(ev):
         r = browser(p, [{"do": "open", "url": STAGE, "settle": 5000}, {"do": "eval", "as": "layout", "expr": HOME_CHIPS_PROBE}])
@@ -884,6 +944,9 @@ def main() -> int:
               ev["stage still readable"] == 200, "token checks failed")
     p.run("CONTROL_TOKEN and TRIGGER_TOKEN lock changes; the stage stays readable", tokens, long=True)
 
+    p.run("REBUILD=off: a rebuild is refused and not offered; everything else stays open",
+          lambda ev: rebuild_switch(ev, p), long=True)
+
     # ---- UI ----
     p.section = "Stage and presenter UI"
 
@@ -995,7 +1058,7 @@ def main() -> int:
         listed = [e["name"] for e in api("GET", "/api/explainers")[1]]
         page = api("GET", "/explainer/chaos")[1]
         from controlplane.explainers import render_chaos
-        azure = load_preset(ROOT / "presets", "azure", catalog, default_version="v26.3.2", subnet="10.77.0.0/16", max_nodes=15)
+        azure = load_preset(ROOT / "presets", "azure", catalog, default_version="v26.4.1", subnet="10.77.0.0/16", max_nodes=15)
         html_ = render_chaos((ROOT / "web" / "explainers" / "chaos.html").read_text(), azure, catalog, "Contoso Pay")
         r = browser(p, [{"do": "open", "url": f"{PANEL}/explainer/chaos?capture=1&t=20", "settle": 4000},
                         {"do": "shot", "file": p.shot("explainer-chaos")}])

@@ -209,6 +209,9 @@ __marimo__/
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Editor swap files (vim leaves one beside a file that is open)
+*.swp
 # Brainstorming companion (mockups, prototype explainers, exported videos)
 .superpowers/
 

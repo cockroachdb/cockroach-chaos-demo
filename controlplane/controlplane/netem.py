@@ -56,8 +56,16 @@ def _netem(delay_ms: float, brownout: Brownout | None, loss_pct: float) -> str:
 
 
 def tc_script(node: NodeSpec, topo: Topology, *, prefix: str, scale: float | None, brownout: Brownout | None,
-              isolated: bool, dev: str = "eth0") -> str:
-    lines = [f"tc qdisc del dev {dev} root 2>/dev/null; true"]
+              isolated: bool) -> str:
+    # The interface to shape is the one that holds the node's address on the demo's network, whatever it is called.
+    # It is eth0 on a node that is on that network alone. A node attached to a second network can come back from a
+    # restart, or from a partition and its recovery, with the demo's network on eth1: shaping "eth0" then delayed the
+    # other network, left the demo's as fast as the machine, and reported success. A node whose address is on no
+    # interface is not shaped at all: the helper fails and says so.
+    dev = '"$dev"'
+    lines = [f"set -- $(ip -o -4 addr show to {node.ip}); dev=$2",
+             f'[ -n "$dev" ] || {{ echo "no network interface holds {node.ip}" >&2; exit 1; }}',
+             f"tc qdisc del dev {dev} root 2>/dev/null; true"]
     if scale is None and brownout is None and not isolated:
         return "\n".join(lines)
     own = next(r for r in topo.regions if r.name == node.region)

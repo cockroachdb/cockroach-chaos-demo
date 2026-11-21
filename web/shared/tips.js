@@ -44,17 +44,29 @@ export function initTips({ layer = document.body, scale = () => 1, delay = 250 }
     anchor = null;
   };
 
-  document.addEventListener('mouseover', (e) => {
-    const target = e.target.closest && e.target.closest('[data-tip]');
+  // Where the pointer was last pressed, until it moves away from there. A click often changes what is under the pointer
+  // (a menu closes over the buttons behind it) and the browser then reports that element as hovered. Nobody pointed at
+  // it: its tooltip would open over the stage and stay there while the presenter talks. A hand is never quite still,
+  // so "moved" means by more than a few pixels.
+  let pressed = null;
+
+  const hover = (target) => {
     if (!target) { if (anchor || pending) hide(); return; }
-    if (target === anchor) return;
+    if (target === anchor || pressed) return;
     clearTimeout(pending);
     if (anchor) show(target);  // already showing one: switch without the delay
     else pending = setTimeout(() => show(target), delay);
-  });
-  document.addEventListener('mousemove', (e) => { mouse = [e.clientX, e.clientY]; }, { passive: true });
+  };
+
+  document.addEventListener('mouseover', (e) => hover(e.target.closest && e.target.closest('[data-tip]')));
+  document.addEventListener('mousemove', (e) => {
+    mouse = [e.clientX, e.clientY];
+    if (!pressed || Math.hypot(mouse[0] - pressed[0], mouse[1] - pressed[1]) <= 6) return;
+    pressed = null;  // moving on purpose again: what is under the pointer now may have a tooltip
+    hover(e.target.closest && e.target.closest('[data-tip]'));
+  }, { passive: true });
   document.addEventListener('scroll', hide, true);
-  document.addEventListener('pointerdown', hide, true);
+  document.addEventListener('pointerdown', (e) => { pressed = [e.clientX, e.clientY]; hide(); }, true);
 
   // Re-render replaced the target? Re-anchor to the element now under the pointer, with fresh text.
   new MutationObserver(() => {

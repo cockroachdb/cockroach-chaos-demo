@@ -26,7 +26,7 @@ services:
     environment:
       PRESET: ${PRESET:-aws}
       DEPLOYMENT_MODEL: ${DEPLOYMENT_MODEL:-multi-region}
-      CRDB_VERSION: ${CRDB_VERSION:-v26.3.2}
+      CRDB_VERSION: ${CRDB_VERSION:-v26.4.1}
       CHAOS_SUBNET: ${CHAOS_SUBNET:-10.77.0.0/16}
       CHAOS_NETWORK: crdb-chaos
       MAX_NODES: ${MAX_NODES:-15}
@@ -34,6 +34,7 @@ services:
       CRDB_LICENSE: ${CRDB_LICENSE:-}
       CRDB_ORG: ${CRDB_ORG:-}
       CONTROL_TOKEN: ${CONTROL_TOKEN:-}
+      REBUILD: ${REBUILD:-on}
       TRIGGER_TOKEN: ${TRIGGER_TOKEN:-}
       PANEL_PORT: ${PANEL_PORT:-8088}
     ports:

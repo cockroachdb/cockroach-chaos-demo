@@ -37,8 +37,8 @@ def web(tmp_path):
     return tmp_path
 
 
-def make_client(web, operations=None, provisioner=None):
-    settings = SimpleNamespace(presets_dir=ROOT / "presets", web_dir=web)
+def make_client(web, operations=None, provisioner=None, rebuild=True):
+    settings = SimpleNamespace(presets_dir=ROOT / "presets", web_dir=web, rebuild=rebuild)
     collector = SimpleNamespace(latest=lambda: {"cluster": None, "nodes": []})
     app = create_app(settings=settings, provisioner=provisioner or Recorder(), collector=collector,
                      operations=operations or Operations(), load_topology=load, run_in_background=lambda fn: fn())
@@ -64,6 +64,31 @@ def test_rebuild_accepts_valid_presets(web):
 def test_rebuild_rejects_unknown_presets_with_the_reason(web):
     resp = make_client(web).post("/api/cluster/rebuild", json={"preset": "mars"})
     assert resp.status_code == 400 and "unknown preset" in resp.json()["detail"]
+
+
+def test_rebuild_is_refused_on_an_instance_that_switched_it_off(web):
+    """REBUILD=off, for a cluster other people use. On the hosted instance one rebuild from the stage wiped the
+    database Banko banks on, and Banko stayed broken until the VM was replaced."""
+    rec = Recorder()
+    rec.provisioned = lambda: True
+    resp = make_client(web, provisioner=rec, rebuild=False).post("/api/cluster/rebuild", json={"preset": "gcp"})
+    assert resp.status_code == 403 and rec.rebuilt == []
+    assert "switched off" in resp.json()["detail"] and "REBUILD=off" in resp.json()["detail"]
+    # the answer does not depend on what was asked for: a preset that does not exist gets the same refusal
+    assert make_client(web, provisioner=rec, rebuild=False).post("/api/cluster/rebuild", json={"preset": "mars"}).status_code == 403
+
+
+def test_a_cluster_that_never_finished_building_can_be_rebuilt_even_then(web):
+    """There is nothing to protect yet, and ./run.sh up retries a first build that failed by asking for a rebuild."""
+    rec = Recorder()
+    rec.provisioned = lambda: False
+    resp = make_client(web, provisioner=rec, rebuild=False).post("/api/cluster/rebuild", json={"preset": "gcp"})
+    assert resp.status_code == 202 and rec.rebuilt == ["gcp"]
+
+
+def test_the_presenter_is_told_whether_rebuild_is_on(web):
+    assert make_client(web).get("/api/system").json()["rebuild"] is True
+    assert make_client(web, rebuild=False).get("/api/system").json()["rebuild"] is False
 
 
 def test_rebuild_is_refused_while_another_operation_runs(web):

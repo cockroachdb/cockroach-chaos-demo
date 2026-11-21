@@ -56,6 +56,10 @@ class Provisioner:
             return True
         return False
 
+    def provisioned(self) -> bool:
+        """Whether a finished cluster exists: one that was built to the end and is not being rebuilt."""
+        return bool(load_state(self._settings.data_dir).get("provisioned"))
+
     def provision(self, topo: Topology, kind: str = "provision") -> None:
         op = self._ops.start(kind)
         self._run(op, lambda: self._provision(op, topo))

@@ -613,18 +613,39 @@ function drawChart() {
   if (w0 && w0.failure_at && w0.recovery_s != null && w0.recovery_s > 0 && now - (w0.failure_at + w0.recovery_s) <= span) {
     marks.push({ ts: w0.failure_at + w0.recovery_s, level: 'recovered', text: `Recovered in ${w0.recovery_s.toFixed(1)} s` });
   }
-  let lastLabelX = -1e9;
-  for (const m of marks.sort((a, b) => a.ts - b.ts)) {
-    const x = X(m.ts);
+  marks.sort((a, b) => a.ts - b.ts);
+  const labels = marks.map((m) => ({ x: X(m.ts), text: m.text.toUpperCase().slice(0, 28) }));
+  ctx.font = '12px "Geist Mono"';
+  const places = placeLabels(labels, (text) => ctx.measureText(text).width);
+  marks.forEach((m, i) => {
+    const x = labels[i].x;
     const color = m.level === 'bad' ? cssVar('--failed') : cssVar('--healthy-line');
     ctx.save(); ctx.strokeStyle = color; ctx.setLineDash(m.level === 'bad' ? [5, 5] : [2, 5]); ctx.lineWidth = 1.4;
     ctx.beginPath(); ctx.moveTo(x, 4); ctx.lineTo(x, h - 18); ctx.stroke(); ctx.restore();
-    if (x - lastLabelX > 150) {
-      ctx.fillStyle = color; ctx.font = '12px "Geist Mono"'; ctx.textAlign = x > w - 220 ? 'right' : 'left';
-      ctx.fillText(m.text.toUpperCase().slice(0, 28), x + (x > w - 220 ? -8 : 8), 16);
-      lastLabelX = x;
-    }
-  }
+    if (!places[i]) return;
+    ctx.save(); ctx.beginPath(); ctx.rect(x0, 0, w - x0, h); ctx.clip();  // a label scrolling out stays off the axis numbers
+    ctx.fillStyle = color; ctx.textAlign = 'right';
+    ctx.fillText(labels[i].text, places[i].x, 16 + 15 * places[i].row);
+    ctx.restore();
+  });
+}
+
+const LABEL_GAP = 8;
+
+// Where the labels of the chart's markers go. marks: [{ x, text }], oldest first; measure(text) is its width.
+// One entry per marker: { x, row } for a label that ends at x on that row, or null for one that is left out.
+// Every label sits on the left of its line, so the labels keep their places as the chart scrolls. One that would run
+// into the label before it on a row drops to the next row; one with no room on any row is left out, and only its
+// line is drawn. Three rows fit above the traffic: the y axis leaves that much headroom over the highest point.
+function placeLabels(marks, measure) {
+  const taken = [-Infinity, -Infinity, -Infinity];  // where the last label on each row ends
+  return marks.map((m) => {
+    const end = m.x - LABEL_GAP;
+    const row = taken.findIndex((last) => end - measure(m.text) >= last + LABEL_GAP);
+    if (row < 0) return null;
+    taken[row] = end;
+    return { x: end, row };
+  });
 }
 
 /* ---------- events, booth, scenario, operations ---------- */
@@ -681,8 +702,22 @@ function renderResult(box, result) {
   }));
 }
 
+// A step the presenter has just started from this stage: { seen: the scenario as it was at the press, until: when to
+// stop waiting }. The snapshot that shows the step running is a few seconds away (the collector builds one every 1.5 s
+// and the stream sends one a second). Until a snapshot arrives that differs from the one the step was started on, the
+// panel says "Running…" itself; otherwise the screen stays as it was and the presenter presses again.
+let stepping = null;
+
+async function nextStep() {
+  const seen = state && state.scenario ? JSON.stringify(state.scenario) : null;
+  const ok = await post('/api/scenarios/next');
+  if (ok && seen) { stepping = { seen, until: Date.now() + 6000 }; renderScenario(state); }
+  return ok;
+}
+
 function renderScenario(s) {
   const sc = s.scenario;
+  if (stepping && (!sc || JSON.stringify(sc) !== stepping.seen || Date.now() > stepping.until)) stepping = null;
   document.body.classList.toggle('has-scenario', Boolean(sc));
   $('scenario').hidden = !sc;
   if (!sc) return;
@@ -694,13 +729,14 @@ function renderScenario(s) {
   $('sc-caption').textContent = cur ? cur.caption : sc.summary;
   $('sc-observe').textContent = cur ? cur.observe : `Next: ${sc.steps[0].label}`;
   const box = $('sc-result');
-  if (sc.busy) { box.className = 'sc-result'; box.replaceChildren(el('div', 'busy', i < 0 ? 'Preparing…' : 'Running…')); }
+  const running = sc.busy || Boolean(stepping);
+  if (running) { box.className = 'sc-result'; box.replaceChildren(el('div', 'busy', i < 0 && !stepping ? 'Preparing…' : 'Running…')); }
   else if (cur && cur.error) { box.className = 'sc-result'; box.replaceChildren(el('div', 'err', cur.error)); }
   else if (!cur && sc.steps[0] && sc.steps[0].error) { box.className = 'sc-result'; box.replaceChildren(el('div', 'err', sc.steps[0].error)); }
   else renderResult(box, cur && cur.result);
   const next = $('sc-next');
   const last = i >= sc.steps.length - 1;
-  next.disabled = sc.busy || last;
+  next.disabled = running || last;
   next.textContent = last ? 'Done' : i < 0 ? `Start: ${sc.steps[0].label} ▸` : `Next: ${sc.steps[i + 1].label} ▸`;
 }
 
@@ -855,7 +891,7 @@ function onKey(e) {
   else if (k === 't' || k === 'T') toggleTheme();
   else if (k === 'f' || k === 'F') { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {}); }
   else if (k === 'e' || k === 'E') location.href = '/explainer/playlist?return=/';
-  else if ((k === 'n' || k === 'N' || k === 'ArrowRight') && canControl && state && state.scenario) post('/api/scenarios/next');
+  else if ((k === 'n' || k === 'N' || k === 'ArrowRight') && canControl && state && state.scenario) press('sc-next', nextStep);
   else if (k === 'c' || k === 'C') { if (state) celebrate(state); }
   else if (k === 'Escape') { closeMenu(); toggleDrawer(false); if (confirmDialog.cancel) confirmDialog.cancel(); }
 }
@@ -886,7 +922,7 @@ addEventListener('message', (e) => {
 $('frame').addEventListener('click', () => { if (!$('drawer').hidden) toggleDrawer(false); }, true);
 $('sc-next').dataset.fb = 'sc-next';
 $('sc-stop').dataset.fb = 'sc-stop';
-$('sc-next').onclick = () => press('sc-next', () => post('/api/scenarios/next'));
+$('sc-next').onclick = () => press('sc-next', nextStep);
 $('sc-stop').onclick = () => press('sc-stop', () => post('/api/scenarios/stop'));
 refreshControl();
 const events = new EventSource('/api/events');

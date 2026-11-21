@@ -1,10 +1,11 @@
 import random
+import re
 
 import psycopg
 import pytest
 
 from controlplane.homing import shares
-from controlplane.workload import ACCOUNTS, MAX_RETRIES, TOTAL, Stats, Workload, classify, recovery_time
+from controlplane.workload import ACCOUNTS, MAX_RETRIES, TOTAL, Stats, Workload, classify, expiry_rate_limit, recovery_time
 
 
 class SqlState(Exception):
@@ -60,6 +61,9 @@ class FakeCursor:
         self.db.sql.append(sql)
         self.db.calls.append((sql, params))
         self.last = sql
+        if self.db.refused and sql.startswith(self.db.refused):
+            raise psycopg.errors.QueryCanceled("query execution canceled due to statement timeout")
+        self.db.note(sql)
 
     def fetchall(self):
         if "SELECT id FROM accounts" in self.last:
@@ -67,6 +71,14 @@ class FakeCursor:
         return []
 
     def fetchone(self):
+        if "SHOW CREATE TABLE" in self.last:
+            name = self.last.split()[-1]
+            return (name, self.db.definition(name))
+        if "SHOW ZONE CONFIGURATION FROM TABLE" in self.last:
+            table = self.last.split()[-1]  # the effective configuration; an untouched table reports its database's
+            zone = f"TABLE {table}" if table in self.db.gc else "DATABASE chaos"
+            return (zone, f"ALTER {zone} CONFIGURE ZONE USING\n\trange_max_bytes = 536870912,\n\t"
+                          f"gc.ttlseconds = {self.db.gc.get(table, 14400)},\n\tnum_replicas = 5")
         if "information_schema" in self.last:
             return self.db.id_type
         if "count(*)" in self.last:
@@ -89,9 +101,41 @@ class FakeDB:
         self.sql, self.calls, self.count, self.total, self.id_type = [], [], count, total, None
         self.hosts, self.refuse = [], set()  # every host connected to; hosts whose connection is refused
         self.rowcount = 1  # what every UPDATE reports
+        self.made, self.changed = {}, {}  # table -> the statement that made it; table -> storage parameters set since
+        self.refused = None  # the start of a statement that times out
+        self.gc = {}  # table -> gc.ttlseconds set on it; the others have CockroachDB's four hours
 
     def cursor(self):
         return FakeCursor(self)
+
+    def note(self, sql):
+        """Remember what a statement does to a table's definition."""
+        made, dropped = re.match(r"CREATE TABLE IF NOT EXISTS (\w+)", sql), re.match(r"DROP TABLE (\w+)", sql)
+        changed = re.match(r"ALTER TABLE (\w+) SET \((.*)\)$", sql)
+        if made:
+            self.made.setdefault(made.group(1), sql)  # IF NOT EXISTS: a table that is there stays as it is
+        elif dropped:
+            self.made.pop(dropped.group(1), None)
+            self.changed.pop(dropped.group(1), None)
+        elif changed:
+            self.changed.setdefault(changed.group(1), {}).update(re.findall(r"(\w+) = ('[^']*'|\d+)", changed.group(2)))
+        window = re.match(r"ALTER TABLE (\w+) CONFIGURE ZONE USING gc\.ttlseconds = (\d+)$", sql)
+        if window:
+            self.gc[window.group(1)] = int(window.group(2))
+        if dropped:
+            self.gc.pop(dropped.group(1), None)  # the zone configuration goes with the table
+
+    def definition(self, table):
+        """What SHOW CREATE TABLE says: the table as it was made, with the storage parameters set since."""
+        text = self.made[table]
+        for key, value in self.changed.get(table, {}).items():
+            if re.search(rf"\b{key} = ", text):
+                text = re.sub(rf"\b{key} = ('[^']*'|\d+)", lambda m: f"{key} = {value}", text)
+            elif "WITH (" in text:
+                text = text.replace("WITH (", f"WITH ({key} = {value}, ", 1)
+            else:
+                text = f"{text} WITH ({key} = {value})"
+        return text
 
     def connect(self, host, **kw):
         db = self
@@ -223,6 +267,32 @@ def test_stopping_clears_a_pending_recovery_measurement():
     assert w.status()["failure_at"] is None and w.status()["recovering"] is False
 
 
+def test_a_new_run_of_payments_starts_with_no_recovery_reading():
+    """The stage's "Recovered in" tile shows the last measurement. It stays up after Payments stops, as the result of
+    that run. A run that has just started has seen no failure: a number from an earlier run (a rehearsal, say) must
+    not be on the screen before anything has gone wrong."""
+    now = [100.0]
+    w = Workload(FakeDB(count=ACCOUNTS).connect, host="haproxy", clock=lambda: now[0])
+    w._worker = lambda index: None  # this test is about what start() resets: its threads have nothing to do
+    w._checker = lambda: None
+    w.workers = 2
+    w.running = True
+    for second in range(90, 104):  # steady before the failure at 100 and after it: commits never dipped
+        for _ in range(10):
+            w.stats.commit(5, "us-east-1", now=second + 0.5)
+    w.mark_failure()
+    now[0] = 104.0
+    assert w.status()["recovery_s"] == 0.0
+    w.stop()
+    assert w.status()["recovery_s"] == 0.0
+    w.start()
+    try:
+        status = w.status()
+        assert status["recovery_s"] is None and status["recovering"] is False and status["failure_at"] is None
+    finally:
+        w.stop()
+
+
 def test_rates_average_the_last_three_seconds_so_the_stage_number_holds_steady():
     # one slow second must not read as a collapse on the big screen: 250, 250, 156 -> 219, not 156
     s = Stats(clock=lambda: 13.5)
@@ -255,6 +325,7 @@ class HomedDB(FakeDB):
     def __init__(self, regions=("us-east-1", "us-west-2", "eu-west-1"), layout=None, counts=None, holder_home=True):
         super().__init__(count=ACCOUNTS)
         self.regions, self.layout, self.counts, self.holder_home = list(regions), layout or {}, counts, holder_home
+        self.made = {table: create for table, (_, create) in self.layout.items()}
 
     def cursor(self):
         return HomedCursor(self)
@@ -277,9 +348,6 @@ class HomedCursor(FakeCursor):
 
     def fetchone(self):
         last = self.last
-        if "SHOW CREATE TABLE" in last:
-            name = last.split()[-1]
-            return (name, self.db.layout[name][1])
         if "SHOW RANGE FROM TABLE" in last:
             region = last.split("FOR ROW ('")[1].split("'")[0]
             if getattr(self.db, "range_of", None):  # a test says where each partition's range is
@@ -302,7 +370,7 @@ def test_a_multi_region_database_gets_tables_keyed_by_region():
     assert joined.index("DROP TABLE accounts") < joined.index("CREATE TABLE IF NOT EXISTS accounts")
     assert "DROP TABLE transfers" in joined
     assert "PRIMARY KEY (crdb_region, id)) LOCALITY REGIONAL BY ROW" in joined
-    assert "WITH (ttl_expire_after = '1 hour') LOCALITY REGIONAL BY ROW" in joined
+    assert "WITH (ttl_expire_after = '1 hour'" in joined and joined.count("LOCALITY REGIONAL BY ROW") == 2
     assert w.homed and w.regions == ["us-east-1", "us-west-2", "eu-west-1"] and w.primary == "us-east-1"
     assert sorted(w._homes) == ["eu-west-1", "us-east-1", "us-west-2"] and len(w._ids) == 9
 
@@ -358,6 +426,148 @@ def test_a_single_region_database_keeps_the_plain_layout():
     w = Workload(db.connect, host="haproxy", cluster=dict)
     w.setup()
     assert any("id UUID PRIMARY KEY DEFAULT gen_random_uuid()" in s for s in db.sql) and not w.homed
+
+
+# -- transfer rows expire after an hour: how often the job runs, and how fast it may delete --
+
+# a transfers table as versions before this one made it, the way SHOW CREATE TABLE prints it
+OLD_TRANSFERS = ("REGIONAL BY ROW", "CREATE TABLE public.transfers (... CONSTRAINT transfers_pkey PRIMARY KEY (crdb_region ASC, id ASC)) "
+                 "WITH (ttl = 'on', ttl_expire_after = '01:00:00':::INTERVAL, schema_locked = true) LOCALITY REGIONAL BY ROW")
+EVERY_TEN_MINUTES = "ttl_job_cron = '*/10 * * * *'"
+
+
+def expiry_changes(db):
+    return [s for s in db.sql if s.startswith("ALTER TABLE transfers SET")]
+
+
+def created_transfers(db):
+    return next(s for s in db.sql if s.startswith("CREATE TABLE IF NOT EXISTS transfers"))
+
+
+def test_the_expiry_job_may_delete_twice_what_payments_insert():
+    """CockroachDB limits the job per node: 100 rows a second unless told otherwise. Measured on three regions that
+    is 291 rows a second against the 250 Payments insert, and 100 on one node: too low, and the table grows for
+    ever. Much higher shows on the stage: at 1,900 a second Payments fell from 246 to 212 a second, with dips to 114."""
+    assert expiry_rate_limit(250, nodes=3) == 167  # three regions; each one's leaseholder deletes its own rows
+    assert expiry_rate_limit(250, nodes=4) == 125
+    assert expiry_rate_limit(250, nodes=1) == 500  # the plain layout: one node does all of it
+    assert expiry_rate_limit(5000, nodes=1) == 10_000  # the highest rate Payments can be set to
+    assert expiry_rate_limit(30, nodes=3) == 100  # never below CockroachDB's own default
+
+
+def test_new_transfers_tables_expire_rows_every_ten_minutes_at_a_rate_that_keeps_up():
+    """Without ttl_job_cron the job runs once a day, at midnight UTC: Payments left on kept a day of transfers,
+    21.6 million rows, where the table says an hour."""
+    db = HomedDB()
+    Workload(db.connect, host="haproxy", cluster=dict).setup()
+    assert f"WITH (ttl_expire_after = '1 hour', {EVERY_TEN_MINUTES}, ttl_delete_rate_limit = 167) LOCALITY REGIONAL BY ROW" in created_transfers(db)
+    assert expiry_changes(db) == []  # made right: nothing to change afterwards
+    plain = FakeDB(count=ACCOUNTS)
+    Workload(plain.connect, host="haproxy").setup()
+    assert created_transfers(plain).endswith(f"WITH (ttl_expire_after = '1 hour', {EVERY_TEN_MINUTES}, ttl_delete_rate_limit = 500)")
+    assert expiry_changes(plain) == []
+
+
+def test_only_regions_that_home_rows_count_towards_the_delete_rate():
+    db = HomedDB(counts={})
+    db.account_regions = ["us-east-1", "us-west-2"]
+    Workload(db.connect, host="haproxy", cluster=lambda: TIE).setup()  # eu-west-1 only votes: two regions hold the rows
+    assert "ttl_delete_rate_limit = 250)" in created_transfers(db)
+
+
+def test_a_transfers_table_from_an_older_version_gets_the_expiry_settings():
+    """CREATE TABLE IF NOT EXISTS leaves a table that exists alone: a cluster that is already running would keep its
+    daily job."""
+    db = HomedDB(layout={"accounts": HOMED, "transfers": OLD_TRANSFERS}, counts=FULL)
+    Workload(db.connect, host="haproxy", cluster=dict).setup()
+    assert expiry_changes(db) == [f"ALTER TABLE transfers SET ({EVERY_TEN_MINUTES}, ttl_delete_rate_limit = 167)"]
+    assert not any(s.startswith(("DROP TABLE", "TRUNCATE")) for s in db.sql)
+
+
+def test_an_older_plain_transfers_table_gets_the_expiry_settings_too():
+    db = FakeDB(count=ACCOUNTS)
+    db.made["transfers"] = ("CREATE TABLE public.transfers (id UUID NOT NULL, ... CONSTRAINT transfers_pkey PRIMARY KEY (id ASC)) "
+                            "WITH (ttl = 'on', ttl_expire_after = '01:00:00':::INTERVAL, schema_locked = true)")
+    Workload(db.connect, host="haproxy").setup()
+    assert expiry_changes(db) == [f"ALTER TABLE transfers SET ({EVERY_TEN_MINUTES}, ttl_delete_rate_limit = 500)"]
+
+
+def test_starting_payments_again_leaves_a_table_that_is_right_alone():
+    """Each change is a schema change on a table that is being written to, and it ends the expiry job that is running."""
+    db = HomedDB(layout={"accounts": HOMED, "transfers": OLD_TRANSFERS}, counts=FULL)
+    w = Workload(db.connect, host="haproxy", cluster=dict)
+    w.setup()
+    w.setup()
+    assert len(expiry_changes(db)) == 1
+
+
+def test_a_new_payments_rate_changes_how_fast_rows_may_be_deleted():
+    db = HomedDB(layout={"accounts": HOMED, "transfers": OLD_TRANSFERS}, counts=FULL)
+    w = Workload(db.connect, host="haproxy", cluster=dict)
+    w.setup()
+    w.configure(workers=48, rate=1000)  # Payments is not running: the next start sets the table up for the new rate
+    w.setup()
+    assert expiry_changes(db)[-1] == f"ALTER TABLE transfers SET ({EVERY_TEN_MINUTES}, ttl_delete_rate_limit = 667)"
+
+
+def test_payments_start_even_when_the_expiry_settings_cannot_be_changed():
+    """The change waits behind any other schema change on the table, a region joining or leaving for one. It is
+    housekeeping: Payments start without it and the next start tries again."""
+    db = HomedDB(layout={"accounts": HOMED, "transfers": OLD_TRANSFERS}, counts=FULL)
+    db.refused = "ALTER TABLE transfers SET"
+    w = Workload(db.connect, host="haproxy", cluster=dict, sleep=lambda s: None)
+    w.setup()
+    assert w.homed and len(w._ids) == 9
+    assert len(expiry_changes(db)) == 1  # tried once, not once for every retry of the whole setup
+
+
+# -- old versions of the two Payments tables are kept ten minutes, not four hours --
+
+TEN_MINUTES = ["ALTER TABLE accounts CONFIGURE ZONE USING gc.ttlseconds = 600",
+               "ALTER TABLE transfers CONFIGURE ZONE USING gc.ttlseconds = 600"]
+
+
+def window_changes(db):
+    return [s for s in db.sql if "CONFIGURE ZONE" in s]
+
+
+def test_the_payments_tables_keep_old_versions_for_ten_minutes():
+    """Every payment overwrites two account rows, and every expired transfer is deleted. CockroachDB keeps what was
+    overwritten or deleted for four hours unless told otherwise: after six hours of payments 10,000 accounts carried
+    11.3 million old versions, 1.4 GB, and the disk grew 1.5 GB an hour. Nothing reads the history of these two
+    tables."""
+    db = HomedDB()
+    Workload(db.connect, host="haproxy", cluster=dict).setup()
+    assert window_changes(db) == TEN_MINUTES
+    plain = FakeDB(count=ACCOUNTS)
+    Workload(plain.connect, host="haproxy").setup()
+    assert window_changes(plain) == TEN_MINUTES
+
+
+def test_tables_that_keep_ten_minutes_already_are_left_alone():
+    db = HomedDB(layout={"accounts": HOMED, "transfers": OLD_TRANSFERS}, counts=FULL)
+    w = Workload(db.connect, host="haproxy", cluster=dict)
+    w.setup()
+    w.setup()
+    assert window_changes(db) == TEN_MINUTES
+
+
+def test_a_table_that_is_made_again_gets_its_ten_minutes_again():
+    """Dropping a table drops its zone configuration: the plain layout's tables are replaced on a multi-region
+    database."""
+    db = HomedDB(layout={"accounts": PLAIN, "transfers": PLAIN})
+    db.gc = {"accounts": 600, "transfers": 600}
+    Workload(db.connect, host="haproxy", cluster=dict).setup()
+    assert window_changes(db) == TEN_MINUTES
+
+
+def test_payments_start_even_when_one_tables_window_cannot_be_changed():
+    db = HomedDB(layout={"accounts": HOMED, "transfers": OLD_TRANSFERS}, counts=FULL)
+    db.refused = "ALTER TABLE accounts CONFIGURE ZONE"
+    w = Workload(db.connect, host="haproxy", cluster=dict, sleep=lambda s: None)
+    w.setup()
+    assert w.homed and len(w._ids) == 9
+    assert window_changes(db) == TEN_MINUTES and db.gc == {"transfers": 600}  # each table on its own
 
 
 LIVE = {"regions": [{"name": "us-east-1", "location": [38.9, -77.4], "primary": True},

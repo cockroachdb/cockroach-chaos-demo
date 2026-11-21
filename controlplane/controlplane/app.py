@@ -131,6 +131,7 @@ def create_app(*, settings, provisioner, collector, operations, load_topology, c
     app = FastAPI(title="CockroachDB chaos control plane")
     control_token = getattr(settings, "control_token", None)
     trigger_token = getattr(settings, "trigger_token", None)
+    rebuild_on = getattr(settings, "rebuild", True)
 
     def authorized(request: Request) -> bool:
         if not control_token:
@@ -188,6 +189,12 @@ def create_app(*, settings, provisioner, collector, operations, load_topology, c
 
     @app.post("/api/cluster/rebuild", status_code=202, dependencies=guarded)
     def rebuild(req: RebuildRequest):
+        # REBUILD=off: other people use this cluster, and a rebuild wipes every database on it, theirs included. A
+        # cluster that never finished building has nothing to protect, and ./run.sh up retries a first build that
+        # failed by asking for a rebuild. A provisioner that cannot say counts as having a cluster.
+        if not rebuild_on and getattr(provisioner, "provisioned", lambda: True)():
+            raise HTTPException(status_code=403, detail="Rebuilding is switched off on this instance (REBUILD=off): "
+                                                        "it would wipe every database on a cluster other people are using.")
         try:
             topo = load_topology(req.preset, model=req.model) if req.model else load_topology(req.preset)
         except PresetError as e:
@@ -399,7 +406,7 @@ def create_app(*, settings, provisioner, collector, operations, load_topology, c
     @app.get("/api/system")
     def system(request: Request):
         """Presenter-only facts (real endpoints, connection strings). Never rendered on the stage."""
-        return {"authorized": authorized(request), "token_required": bool(control_token),
+        return {"authorized": authorized(request), "token_required": bool(control_token), "rebuild": rebuild_on,
                 **(system_info() if system_info else {})}
 
     @app.get("/")

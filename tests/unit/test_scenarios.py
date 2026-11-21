@@ -34,7 +34,7 @@ def ctx_for(topo, **kw):
 def test_requirements_are_reported_per_scenario():
     runner = Runner(ALL, ctx_for(SMALL), run_in_background=lambda f: f())
     by_id = {s["id"]: s for s in runner.catalog(SMALL, "realistic")}
-    assert len(by_id) == 14
+    assert len(by_id) == 15
     assert by_id["time-travel"]["unmet"] == []
     assert "needs 5+ nodes" in by_id["split-brain"]["unmet"]
     assert "needs inter-region latency on" in {s["id"]: s for s in runner.catalog(AWS, "off")}["follower-reads"]["unmet"]
@@ -106,6 +106,8 @@ class RecordingDB:
                     return (1, "us-east-1")
                 if "cluster_logical_timestamp" in self.last:
                     return ("1760054400000000000.0000000000",)
+                if "agent_budget" in self.last:  # (spent, limit): nothing spent yet
+                    return (0, 10_000)
                 return (0,)
 
             def fetchall(self):
@@ -335,19 +337,25 @@ def test_write_skew_withdrawal_backs_off_between_retries_and_always_reports_an_o
     assert sleeps and all(s > 0 for s in sleeps)  # never retries back to back
 
 
-def _voter_ctx(ranges, nodes=((1, "us-east-1"), (2, "us-east-1"), (3, "us-west-2"), (4, "us-west-2"))):
+def _voter_ctx(ranges, nodes=((1, "us-east-1"), (2, "us-east-1"), (3, "us-west-2"), (4, "us-west-2")), refuse=0):
+    """A cluster whose ranges have these voters. refuse: how many statements it refuses first, the way CockroachDB
+    refuses one that needs an answer from a node that is down or still coming back."""
     import itertools
     topo = SimpleNamespace(nodes=[SimpleNamespace(name=f"n{i}", region=r) for i, r in nodes])
     ticks = itertools.count(step=100.0)
+    asked = []
 
     def query(sql, host=None, **kw):
+        asked.append(sql)
+        if len(asked) <= refuse:
+            raise RuntimeError("An error has occurred while fetching span stats.")
         if "gossip_nodes" in sql:
             return [(i, f"n{i}:26257") for i, _ in nodes]
         if "range_id" in sql:
             return [(100 + k, list(v)) for k, v in enumerate(ranges)]
         return [(list(v),) for v in ranges]
 
-    return SimpleNamespace(topo=topo, query=query, clock=lambda: next(ticks), sleep=lambda s: None)
+    return SimpleNamespace(topo=topo, query=query, clock=lambda: next(ticks), sleep=lambda s: None, asked=asked)
 
 
 NINE_NODES = ((1, "us-east-1"), (2, "us-east-1"), (3, "us-east-1"), (4, "eu-west-1"), (5, "eu-west-1"), (6, "eu-west-1"),
@@ -361,6 +369,30 @@ def test_region_survival_placement_means_every_range_survives_losing_any_region(
         L._wait_spread(_voter_ctx([(1, 2, 3)], NINE_NODES))
     with pytest.raises(ScenarioError, match="spreading"):  # 3 of 5 in one region: losing it loses the majority
         L._wait_spread(_voter_ctx([(1, 2, 3, 4, 7)], NINE_NODES))
+
+
+def test_the_placement_waits_read_the_ranges_without_their_details():
+    """SHOW RANGES ... WITH DETAILS needs statistics from every node, and CockroachDB refuses the whole statement while
+    one of them is down or still coming back: "An error has occurred while fetching span stats". These waits run
+    right after a region has been recovered, and all they read is voting_replicas, which the plain statement has."""
+    from controlplane.scenarios import library as L
+    spread, voters = _voter_ctx([(1, 2, 4, 5, 7)], NINE_NODES), _voter_ctx([(1, 2), (3, 4)])
+    L._wait_spread(spread)
+    L._wait_voters(voters, "us-east-1")
+    asked = [sql for sql in spread.asked + voters.asked if "SHOW RANGES" in sql]
+    assert len(asked) == 3 and not any("WITH DETAILS" in sql for sql in asked)
+
+
+def test_a_look_that_is_refused_does_not_end_a_placement_wait():
+    """A node that is still starting can refuse a statement. The wait is for the cluster to get somewhere, so it
+    looks again; if it never gets an answer, the reason is in what the step reports."""
+    from controlplane.scenarios import library as L
+    assert L._wait_spread(_voter_ctx([(1, 2, 4, 5, 7)], NINE_NODES, refuse=1)) >= 0
+    assert L._wait_voters(_voter_ctx([(1, 2), (3, 4)], refuse=1), "us-east-1") >= 0
+    with pytest.raises(ScenarioError, match="spreading.*fetching span stats"):
+        L._wait_spread(_voter_ctx([(1, 2, 4, 5, 7)], NINE_NODES, refuse=10**6))
+    with pytest.raises(ScenarioError, match="still moving.*fetching span stats"):
+        L._wait_voters(_voter_ctx([(1, 2), (3, 4)], refuse=10**6), "us-east-1")
 
 
 def test_the_region_step_waits_for_the_voters_not_the_lagging_counter():
@@ -699,3 +731,153 @@ def test_the_elastic_steps_wait_as_long_as_a_drain_under_load_takes():
     L._remove_region(ctx, {"new_region": "ap-northeast-1"})
     L._decommission(ctx, {"added_node": "us-east-1a-n4"})
     assert len(waits) == 2 and all(seconds >= 1800 for seconds in waits)
+
+
+# -- agents race for one budget: fifty read-decide-write transactions against one row --
+
+class BudgetDB:
+    """One budget row, with the two behaviours that matter. READ COMMITTED: an UPDATE adds to whatever is there now,
+    however old the reader's view was. SERIALIZABLE: an UPDATE by a transaction whose read is stale gets a retry error
+    (40001), as CockroachDB returns. refuse: which connections fail, counted from 1 in the order they are opened."""
+    def __init__(self, limit=10_000, refuse=()):
+        import threading
+        self.lock, self.spent, self.limit, self.version, self.refuse = threading.Lock(), 0, limit, 0, set(refuse)
+        self.opened = 0
+
+    def connect(self, host=None, **kw):
+        db = self
+        with db.lock:
+            db.opened += 1
+            if db.opened in db.refuse:
+                raise OSError("connection refused")
+
+        class Retry(Exception):
+            sqlstate = "40001"
+
+        class Cur:
+            isolation, seen, row = "", None, None
+
+            def execute(self, sql, params=None):
+                with db.lock:
+                    if sql.startswith("BEGIN"):
+                        self.isolation, self.seen = sql.rsplit("LEVEL ", 1)[1], None
+                    elif sql.startswith("SELECT"):
+                        self.row, self.seen = (db.spent, db.limit), db.version
+                    elif sql.startswith("UPDATE"):
+                        if self.isolation == "SERIALIZABLE" and self.seen != db.version:
+                            raise Retry("restart transaction: TransactionRetryWithProtoRefreshError: WriteTooOldError")
+                        db.spent += int(sql.split("spent + ")[1].split()[0])
+                        db.version += 1
+                    elif sql.startswith("UPSERT"):
+                        db.spent, db.version = 0, db.version + 1
+
+            def fetchone(self):
+                return self.row
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return SimpleNamespace(cursor=Cur, close=lambda: None)
+
+
+def budget_ctx(db, sleeps=None):
+    ctx = ctx_for(AWS9, connect=db.connect)
+    ctx.sleep = (sleeps.append if sleeps is not None else (lambda s: None))
+    return ctx
+
+
+def test_read_committed_lets_fifty_agents_overspend_one_budget():
+    from controlplane.scenarios import library as L
+    db = BudgetDB()
+    out = L._budget_race("READ COMMITTED")(budget_ctx(db), {})
+    assert db.spent == 12_500  # every agent saw money left, so every agent spent: nothing stopped them
+    assert out == {"Agents approved": "50 of 50", "Declined": 0, "Conflicts retried": 0,
+                   "Spent": "$12,500 of $10,000", "Budget": "OVERSPENT by $2,500 ✗"}
+
+
+def test_serializable_makes_colliding_agents_retry_and_the_budget_holds():
+    from controlplane.scenarios import library as L
+    db, sleeps = BudgetDB(), []
+    out = L._budget_race("SERIALIZABLE")(budget_ctx(db, sleeps), {})
+    assert db.spent == 10_000
+    assert out["Agents approved"] == "40 of 50" and out["Declined"] == 10
+    assert out["Spent"] == "$10,000 of $10,000" and out["Budget"] == "held ✓"
+    assert out["Conflicts retried"] > 0 and len(sleeps) == out["Conflicts retried"]  # each retry waits first
+    assert all(s > 0 for s in sleeps)
+
+
+def test_the_race_starts_from_a_fresh_budget_each_time():
+    from controlplane.scenarios import library as L
+    db = BudgetDB()
+    ctx = budget_ctx(db)
+    L._budget_race("READ COMMITTED")(ctx, {})
+    assert L._budget_race("SERIALIZABLE")(ctx, {})["Spent"] == "$10,000 of $10,000"
+
+
+def test_an_agent_that_cannot_connect_does_not_hold_up_the_race():
+    """All fifty wait until each has read the budget. One that never arrives must not leave the others waiting."""
+    import time
+    from controlplane.scenarios import library as L
+    db = BudgetDB(refuse={2})  # the first connection resets the budget; the second is one of the agents
+    started = time.monotonic()
+    out = L._budget_race("READ COMMITTED")(budget_ctx(db), {})
+    assert time.monotonic() - started < 10
+    approved = int(out["Agents approved"].split()[0])
+    assert out["No outcome"] == 1 and approved + out["Declined"] == 49
+
+
+def test_an_agent_that_keeps_colliding_gives_up_with_a_reason_instead_of_hanging():
+    import threading
+    from controlplane.scenarios import library as L
+
+    class Retry(Exception):
+        sqlstate = "40001"
+
+    class Cur:
+        def execute(self, sql, params=None):
+            if sql.startswith("UPDATE"):
+                raise Retry("restart transaction")
+
+        def fetchone(self):
+            return (0, 10_000)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    sleeps, out, retries = [], {}, {}
+    ctx = SimpleNamespace(connect=lambda host=None, **kw: SimpleNamespace(cursor=Cur, close=lambda: None), sleep=sleeps.append)
+    L._spend(ctx, "SERIALIZABLE", 7, threading.Barrier(1), out, retries)
+    assert out[7].startswith("gave up") and retries[7] == len(sleeps) > 10
+
+
+def test_the_budget_scenario_is_offered_next_to_write_skew():
+    ids = [s.id for s in ALL]
+    assert ids.index("agent-budget") == ids.index("write-skew") + 1
+    budget = next(s for s in ALL if s.id == "agent-budget")
+    assert [step.label for step in budget.steps] == ["Race under READ COMMITTED", "Race under SERIALIZABLE"]
+    assert "$10,000" in budget.summary and "Fifty agents" in budget.summary
+
+
+def test_the_agents_connect_next_to_the_budget_in_the_primary_region():
+    from controlplane.scenarios import library as L
+    hosts = []
+    db = BudgetDB()
+    ctx = ctx_for(AWS9, connect=lambda host=None, **kw: (hosts.append(host), db.connect(host, **kw))[1],
+                  chaos=SimpleNamespace(down_nodes=lambda: set(), flags=lambda: {}))
+    ctx.sleep = lambda s: None
+    state = {}
+    L._budget_prepare(ctx, state)
+    primary = [n.ip for n in AWS9.nodes if n.region == AWS9.primary.name]
+    assert state["budget_gateway"] in primary
+    del hosts[:]
+    L._budget_race("READ COMMITTED")(ctx, state)
+    assert hosts.count(state["budget_gateway"]) == 50  # every agent; the reset and the final read use the load balancer
+    down = ctx_for(AWS9, connect=db.connect, chaos=SimpleNamespace(down_nodes=lambda: {n.name for n in AWS9.nodes}, flags=lambda: {}))
+    L._budget_prepare(down, state)
+    assert state["budget_gateway"] is None  # no live node in the primary region: the load balancer decides

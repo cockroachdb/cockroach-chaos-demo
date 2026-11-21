@@ -29,14 +29,21 @@ class Settings:
     panel_port: int = 8088
     tls_dir: Path = Path("/app/tls")
     model: str = "multi-region"  # deployment model for new clusters: multi-region | single-region
+    # False on an instance whose cluster other people use (REBUILD=off): a rebuild wipes every database on it.
+    rebuild: bool = True
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Settings":
         def get(name: str, default: str) -> str:
             return env.get(name, "").strip() or default
 
+        # A switch that guards other people's data must not read a typo as "on".
+        rebuild = get("REBUILD", "on").lower()
+        if rebuild not in ("on", "off"):
+            raise ValueError(f"REBUILD must be on or off, not {rebuild!r}")
+
         return cls(
-            crdb_version=get("CRDB_VERSION", "v26.3.2"),
+            crdb_version=get("CRDB_VERSION", "v26.4.1"),
             preset=get("PRESET", "aws"),
             subnet=get("CHAOS_SUBNET", "10.77.0.0/16"),
             network=get("CHAOS_NETWORK", "crdb-chaos"),
@@ -56,4 +63,5 @@ class Settings:
             panel_port=int(get("PANEL_PORT", "8088")),
             tls_dir=Path(get("TLS_DIR", "/app/tls")),
             model=get("DEPLOYMENT_MODEL", "multi-region").lower(),
+            rebuild=rebuild == "on",
         )

@@ -149,9 +149,24 @@ async function loadPresets() {
   renderPresets();
 }
 
+// False on an instance that set REBUILD=off: other people use its cluster, and a rebuild wipes every database on it.
+// The API refuses one there. A button that can only answer "refused" is worse than no button and the reason.
+let rebuildAllowed = true;
+const REBUILD_OFF = 'Rebuilding is switched off on this instance: it would wipe every database on a cluster other people are using.';
+
+function applyRebuildLock() {
+  if (rebuildAllowed) return;
+  $('rebuild-hint').textContent = REBUILD_OFF;
+  $('preset-rebuild').disabled = true;
+  $('preset-rebuild').dataset.tip = REBUILD_OFF;
+  $('model-row').hidden = true;  // the deployment model is a choice for a rebuild
+  lastPresetRender = '';
+  renderPresets();
+}
+
 function renderPresets() {
   const active = state && state.cluster ? state.cluster.preset : null;
-  const key = JSON.stringify([active, presets.map((p) => p.name)]);
+  const key = JSON.stringify([active, rebuildAllowed, presets.map((p) => p.name)]);
   if (key === lastPresetRender) return;
   lastPresetRender = key;
   $('presets').replaceChildren(...presets.map((p) => h('div', { class: `preset ${p.name === active ? 'active' : ''}` },
@@ -159,7 +174,7 @@ function renderPresets() {
     p.error ? h('div', { class: 'e' }, p.error) : [
       h('div', { class: 'd' }, `${p.display_name} · ${p.survival_goal} survival`),
       h('div', { class: 'r' }, p.regions.map((r) => `${r.name} ×${r.nodes}`).join(', ')),
-      h('button', { class: 'btn danger', onclick: () => rebuild(p.name), 'data-tip': G.rebuild }, 'Rebuild with this'),
+      rebuildAllowed ? h('button', { class: 'btn danger', onclick: () => rebuild(p.name), 'data-tip': G.rebuild }, 'Rebuild with this') : null,
     ])));
 }
 
@@ -196,7 +211,7 @@ $('preset-save').onclick = async () => {
   if (r.ok) {
     msg.className = 'msg good';
     msg.textContent = `Saved: ${r.data.regions.map((x) => `${x.name} ×${x.nodes}`).join(', ')} · ${r.data.survival_goal} survival${r.data.warnings.length ? ' · ' + r.data.warnings.join('; ') : ''}`;
-    $('preset-rebuild').disabled = false;
+    $('preset-rebuild').disabled = !rebuildAllowed;
     lastPresetRender = '';
     loadPresets();
   } else { msg.className = 'msg bad'; msg.textContent = detail(r); $('preset-rebuild').disabled = true; }
@@ -405,6 +420,7 @@ async function loadSystem() {
     ['Load balancer stats', d.haproxy_stats], ['Stage', d.stage], ['Presenter', d.presenter], ['Network', `${d.network} · ${d.subnet}`],
     ['Default version', d.crdb_version], ['License', d.license],
     ['Control token', d.token_required ? (d.authorized ? 'required · this browser is unlocked' : 'required · locked') : 'not set (anyone on this network can change the cluster)'],
+    ['Rebuild', d.rebuild === false ? 'switched off on this instance (REBUILD=off)' : null],
   ].filter(([, v]) => v);
   const value = (v) => {
     v = hostify(v);
@@ -480,12 +496,14 @@ function staticTips() {
   const sys = await api('GET', '/api/system');
   if (sys.ok) system = sys.data;
   if (sys.ok && sys.data.token_required && !sys.data.authorized) $('locked').hidden = false;
+  rebuildAllowed = !(sys.ok && sys.data.rebuild === false);
   const cat = await api('GET', '/api/catalog');
   if (cat.ok) {
     catalog = cat.data;
     fillSelect($('add-region-provider'), [...Object.keys(catalog).map((p) => [p, p.toUpperCase()]), ['custom', 'Custom']], false);
   }
   await loadPresets();
+  applyRebuildLock();
   if (presets.length) $('preset-src').onchange();
   showTab(localStorage.getItem('crdb-presenter-tab') || 'cluster');
   const events = new EventSource('/api/events');

@@ -57,9 +57,9 @@
       </div>
       <div class="card">
         <h3>Presets</h3>
-        <div class="row"><span class="msg">Deployment model</span>
+        <div class="row" id="model-row"><span class="msg">Deployment model</span>
           <div class="seg" id="model"><button data-v="multi-region" class="on">Multi-region</button><button data-v="single-region">Single region</button></div></div>
-        <p class="hint">Rebuilding wipes every database, including Banko's <code>defaultdb</code>: restart Banko afterwards.</p>
+        <p class="hint" id="rebuild-hint">Rebuilding wipes every database, including Banko's <code>defaultdb</code>: restart Banko afterwards.</p>
         <div class="presets" id="presets"></div>
       </div>
       <div class="card">

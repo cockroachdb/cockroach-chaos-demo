@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
+import re
 import threading
 import time
 import uuid
@@ -29,7 +31,27 @@ HOMED_ACCOUNTS_DDL = ("CREATE TABLE IF NOT EXISTS accounts (crdb_region crdb_int
                       "PRIMARY KEY (crdb_region, id)) LOCALITY REGIONAL BY ROW")
 HOMED_TRANSFERS_DDL = ("CREATE TABLE IF NOT EXISTS transfers (crdb_region crdb_internal_region NOT NULL, id UUID NOT NULL, "
                        "src UUID NOT NULL, dst UUID NOT NULL, amount INT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now(), "
-                       "PRIMARY KEY (crdb_region, id)) WITH (ttl_expire_after = '1 hour') LOCALITY REGIONAL BY ROW")
+                       "PRIMARY KEY (crdb_region, id)) WITH (ttl_expire_after = '1 hour', {expiry}) LOCALITY REGIONAL BY ROW")
+# One row per transfer id makes a retry after an unanswered commit safe. The rows expire after an hour and a job
+# deletes the expired ones. Left to its defaults that job does not keep the table to an hour:
+#   - it runs once a day, at midnight UTC. Payments left on for a day held a day of rows, 21.6 million;
+#   - it may delete 100 rows a second on each node. Measured (v26.4.1, 250 payments a second): 291 rows a second over
+#     three regions, so 100 on one node, against 250 inserted. It could never work off what had piled up.
+# So the job runs every ten minutes and may delete twice what Payments insert. Not much more than that: the deletes
+# share the nodes with the payments. On a laptop with other work running, 1,900 rows a second took Payments from 246
+# to 212 a second, with dips to 114. At 500 the rate did not move (median 249 a second with and without the job) and
+# the p99 went from 387 to 440 ms.
+EXPIRY_CRON = "*/10 * * * *"  # a row is gone 60 to 75 minutes after it was written: a run takes about half the interval
+EXPIRY_HEADROOM = 2
+# CockroachDB's own default for ttl_delete_rate_limit: never ask for less. And never for 0 to mean "no limit": on the
+# table it reads back as unset, and the default applies (v26.4.1).
+EXPIRY_FLOOR = 100
+# Every payment overwrites two account rows, and every expired transfer is deleted. CockroachDB keeps what was
+# overwritten or deleted for gc.ttlseconds, four hours by default, so that queries can read the past. After six hours
+# of payments 10,000 accounts carried 11.3 million old versions (1.4 GB) and the disk grew 1.5 GB an hour. Nothing reads
+# the past of these two tables: the scenarios that look back in time have tables of their own. Ten minutes is the
+# shortest window Cockroach Labs tests regularly, and its advice is to run an expiry job no more often than the window.
+GC_SECONDS = 600
 NO_ROW = "00000000-0000-0000-0000-000000000000"
 SETTLE_SECONDS = 20.0  # how long a re-homing waits for the payments already on their way to an account that moves
 FORGET_BATCH = 5_000  # transfer rows deleted per statement when a region leaves
@@ -37,6 +59,23 @@ FORGET_BATCH = 5_000  # transfer rows deleted per statement when a region leaves
 # range of the databases to place; the new region's partitions usually get replicas within a minute or two, but once
 # waited more than seven.
 LEASE_ATTEMPTS = 240
+
+
+def expiry_rate_limit(rate: int, nodes: int) -> int:
+    """ttl_delete_rate_limit for the transfers table: the rows a second one node may delete. CockroachDB applies the
+    limit on each node that works on the table, which is the leaseholder of each region's rows on a multi-region
+    layout and one node on the plain one. Together they may delete EXPIRY_HEADROOM times what Payments insert at
+    `rate` transfers a second."""
+    return max(EXPIRY_FLOOR, math.ceil(EXPIRY_HEADROOM * rate / max(1, nodes)))
+
+
+def expiry_settings(rate: int, nodes: int) -> dict[str, str]:
+    """The transfers table's storage parameters for the expiry job, as SQL: {parameter: value}."""
+    return {"ttl_job_cron": f"'{EXPIRY_CRON}'", "ttl_delete_rate_limit": str(expiry_rate_limit(rate, nodes))}
+
+
+def as_sql(settings: dict[str, str]) -> str:
+    return ", ".join(f"{name} = {value}" for name, value in settings.items())
 
 
 def baseline_before(history: list[dict], failure_at: float) -> float:
@@ -255,7 +294,10 @@ class Workload:
                     "(id UUID PRIMARY KEY DEFAULT gen_random_uuid(), balance INT NOT NULL)")
         # One row per transfer id makes retries after ambiguous commits safe; rows expire after an hour.
         cur.execute("CREATE TABLE IF NOT EXISTS transfers (id UUID PRIMARY KEY, src UUID NOT NULL, dst UUID NOT NULL, "
-                    "amount INT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now()) WITH (ttl_expire_after = '1 hour')")
+                    "amount INT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now()) "
+                    f"WITH (ttl_expire_after = '1 hour', {as_sql(expiry_settings(self.rate, 1))})")
+        self._tune_expiry(cur, nodes=1)  # one unpartitioned table: one node deletes
+        self._keep_history_short(cur)
         cur.execute("SELECT count(*) FROM accounts")
         if cur.fetchone()[0] != ACCOUNTS:
             cur.execute("TRUNCATE accounts")
@@ -273,7 +315,9 @@ class Workload:
             if locality != "REGIONAL BY ROW" or "PRIMARY KEY (crdb_region" not in create:
                 cur.execute(f"DROP TABLE {name}")  # the plain layout: transfers expire hourly and accounts are reseeded
         cur.execute(HOMED_ACCOUNTS_DDL)
-        cur.execute(HOMED_TRANSFERS_DDL)
+        cur.execute(HOMED_TRANSFERS_DDL.format(expiry=as_sql(expiry_settings(self.rate, len(regions)))))
+        self._tune_expiry(cur, nodes=len(regions))  # each region's leaseholder deletes its own rows
+        self._keep_history_short(cur)
         expected = shares(ACCOUNTS, regions)
         cur.execute("SELECT crdb_region, count(*) FROM accounts GROUP BY 1")
         have = {str(r): int(c) for r, c in cur.fetchall()}
@@ -291,6 +335,33 @@ class Workload:
         self.homed, self.regions, self.primary = True, list(regions), primary
         self._dealt = deal([None] * self.workers, self.regions)
         self._pin_leases(cur)
+
+    def _tune_expiry(self, cur, nodes: int) -> None:
+        """Bring a transfers table that already existed to the expiry settings for the rate Payments run at now:
+        CREATE TABLE IF NOT EXISTS leaves it as an older version made it, or as the last rate left it. Best effort.
+        The change is a schema change: it waits behind another one on the table (a region joining or leaving) and
+        may time out. Payments start without it and the next start tries again."""
+        try:
+            cur.execute("SHOW CREATE TABLE transfers")
+            have = str(cur.fetchone()[1])
+            want = expiry_settings(self.rate, nodes)
+            if any(not re.search(rf"\b{name} = {re.escape(value)}(?![\w.])", have) for name, value in want.items()):
+                cur.execute(f"ALTER TABLE transfers SET ({as_sql(want)})")
+        except Exception as e:
+            log.warning("transfers expiry settings not applied: %s", e)
+
+    def _keep_history_short(self, cur) -> None:
+        """Set gc.ttlseconds on the two Payments tables (see GC_SECONDS), each on its own and only when it differs.
+        A setting on the table is kept through everything the demo does to the database: regions joining and leaving,
+        the survival goal, the primary and secondary region (tried on v26.4.1). Best effort, like the expiry
+        settings."""
+        for table in ("accounts", "transfers"):
+            try:
+                cur.execute(f"SHOW ZONE CONFIGURATION FROM TABLE {table}")
+                if not re.search(rf"gc\.ttlseconds = {GC_SECONDS}\b", str(cur.fetchone()[1])):
+                    cur.execute(f"ALTER TABLE {table} CONFIGURE ZONE USING gc.ttlseconds = {GC_SECONDS}")
+            except Exception as e:
+                log.warning("gc.ttlseconds not set on %s: %s", table, e)
 
     def _pin_leases(self, cur, regions: list[str] | None = None) -> bool:
         """Move each partition's lease to its home region now instead of waiting minutes for the allocator.
@@ -346,6 +417,7 @@ class Workload:
                 return
             self.setup()
             self._failover = {}
+            self._failure_at = self._baseline = self._recovery = None  # a new run has seen no failure yet
             self._stop.clear()
             self.running = True
             self._threads = [threading.Thread(target=self._worker, args=(i,), daemon=True, name=f"payments-{i}")

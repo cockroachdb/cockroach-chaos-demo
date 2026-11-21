@@ -314,3 +314,14 @@ def test_adopt_saved_reconnects_only_to_a_finished_cluster(tmp_path):
     assert p.adopt_saved() is False  # nothing recorded yet
     save_state(tmp_path, {"topology": topology_to_dict(CLASSIC), "provisioned": True})
     assert p.adopt_saved() is True and p.topology == CLASSIC
+
+
+def test_a_cluster_counts_as_built_only_once_provisioning_has_finished(tmp_path):
+    """What an instance with REBUILD=off protects. Before the first build finishes, and while a rebuild is under way,
+    there is no finished cluster."""
+    p, _ = make(tmp_path, FakeDocker())
+    assert p.provisioned() is False
+    p.provision(CLASSIC)
+    assert p.provisioned() is True
+    save_state(tmp_path, {"topology": load_state(tmp_path)["topology"], "provisioned": False})  # a rebuild has begun
+    assert p.provisioned() is False

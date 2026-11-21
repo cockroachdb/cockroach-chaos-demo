@@ -131,29 +131,38 @@ def _wait_whole(ctx: Context, budget: float, calm: int = 2) -> float:
         ctx.sleep(2)
 
 
+# The placement waits below read voting_replicas, which plain SHOW RANGES has. They do not ask WITH DETAILS: that needs
+# statistics from every node, and CockroachDB refuses the whole statement while one is down or still coming back ("An
+# error has occurred while fetching span stats"). The waits run right after a region was recovered. Any look can
+# still be refused by a node that is starting, so a refused look is a look that has not seen the placement yet.
+
 def _wait_spread(ctx: Context, tables=("accounts", "transfers"), timeout: float = 300) -> float:
     """Wait for REGION survival placement of the Payments tables: every range keeps a majority of its voting replicas
     after losing any one region. Read from the ranges themselves: the under-replicated counter refreshes every 10 s,
     so right after the ALTER it still reads 0 while nothing has moved."""
     started, short = ctx.clock(), "not checked yet"
     while ctx.clock() - started < timeout:
-        where = _node_regions(ctx)
-        regions = set(where.values())
-        short = None
-        for table in tables:
-            rows = ctx.query(f"SELECT range_id, voting_replicas FROM [SHOW RANGES FROM TABLE {table} WITH DETAILS]")
-            for range_id, voters in rows:
-                homes = [where.get(int(v)) for v in voters]
-                lost = next((r for r in regions if 2 * sum(h != r for h in homes) <= len(homes)), None)
-                if lost:
-                    short = f"{table} range {range_id} can't lose {lost} yet"
-                    break
-            if short:
-                break
+        try:
+            short = _not_spread(ctx, tables)
+        except Exception as e:
+            short = f"could not look: {e}"
         if short is None:
             return ctx.clock() - started
         ctx.sleep(3)
     raise ScenarioError(f"replicas are still spreading across regions ({short}); try again in a minute")
+
+
+def _not_spread(ctx: Context, tables) -> str | None:
+    """The first range that would lose its majority with one region, or None when every range survives any region."""
+    where = _node_regions(ctx)
+    regions = set(where.values())
+    for table in tables:
+        for range_id, voters in ctx.query(f"SELECT range_id, voting_replicas FROM [SHOW RANGES FROM TABLE {table}]"):
+            homes = [where.get(int(v)) for v in voters]
+            lost = next((r for r in regions if 2 * sum(h != r for h in homes) <= len(homes)), None)
+            if lost:
+                return f"{table} range {range_id} can't lose {lost} yet"
+    return None
 
 
 def _node_regions(ctx: Context) -> dict[int, str]:
@@ -166,14 +175,18 @@ def _wait_voters(ctx: Context, region: str, timeout: float = 300) -> float:
     """Wait for ZONE survival placement of the accounts table: every range has all its voting replicas in one
     region. The table is REGIONAL BY ROW, so each partition keeps its voters in its own home region and the
     table's own ranges in `region` (the primary); no single region holds them all."""
-    started = ctx.clock()
+    started, refused = ctx.clock(), ""
     while ctx.clock() - started < timeout:
-        where = _node_regions(ctx)
-        ranges = ctx.query("SELECT voting_replicas FROM [SHOW RANGES FROM TABLE accounts WITH DETAILS]")
-        if ranges and all(len({where.get(int(v)) for v in row[0]}) == 1 for row in ranges):
-            return ctx.clock() - started
+        try:
+            where = _node_regions(ctx)
+            ranges = ctx.query("SELECT voting_replicas FROM [SHOW RANGES FROM TABLE accounts]")
+            if ranges and all(len({where.get(int(v)) for v in row[0]}) == 1 for row in ranges):
+                return ctx.clock() - started
+            refused = ""
+        except Exception as e:
+            refused = f" (could not look: {e})"
         ctx.sleep(3)
-    raise ScenarioError("voting replicas are still moving into their home regions; try again in a minute")
+    raise ScenarioError(f"voting replicas are still moving into their home regions{refused}; try again in a minute")
 
 
 def _outage(region_key: str):
@@ -965,6 +978,117 @@ SKEW = Scenario(
 )
 
 
+# -- 7b. agents race for one budget ----------------------------------------------------------------------------
+#
+# The same anomaly as write skew, at the scale agents work at: fifty of them read one budget, each decides it has
+# room, and each spends. An agent here is a client that reads, decides and writes, which is what a tool-calling
+# agent does to a database; no model is involved.
+
+BUDGET, AGENTS, PRICE = 10_000, 50, 250  # 50 x $250 = $12,500 asked of a $10,000 budget: forty fit, ten do not
+SPEND_ATTEMPTS = 60  # an agent retries a conflict with a backoff; this many times is far more than a race needs
+
+
+def _budget_prepare(ctx: Context, state: dict) -> None:
+    try:
+        ctx.run("SET CLUSTER SETTING sql.txn.read_committed_isolation.enabled = true")
+    except Exception:
+        pass  # already on, or not settable on this version
+    ctx.run(["DROP TABLE IF EXISTS agent_budget",
+             "CREATE TABLE agent_budget (id INT PRIMARY KEY, spend_limit INT NOT NULL, spent INT NOT NULL)"])
+    # The agents run next to the budget's leaseholder, in the primary region: from a far region every statement would
+    # add an ocean crossing, and fifty of them in turn make an audience wait.
+    try:
+        state["budget_gateway"] = ctx.gateway(ctx.topo.primary.name)
+    except Exception:
+        state["budget_gateway"] = None  # no live node there: go through the load balancer
+
+
+def _spend(ctx: Context, isolation: str, agent: int, barrier: threading.Barrier, out: dict, retries: dict,
+           host: str | None = None) -> None:
+    """One agent: read what is spent, decide whether $250 more fits, write. Reports approved | declined | why not."""
+    try:
+        conn = ctx.connect(host)
+    except Exception as e:
+        barrier.abort()  # the others wait until every agent has read the budget: this one never will
+        out[agent] = f"error: {e}"
+        return
+    attempts = 0
+    try:
+        with conn.cursor() as cur:
+            while attempts < SPEND_ATTEMPTS:
+                attempts += 1
+                try:
+                    cur.execute(f"BEGIN TRANSACTION ISOLATION LEVEL {isolation}")
+                    cur.execute("SELECT spent, spend_limit FROM agent_budget WHERE id = 1")
+                    spent, limit = cur.fetchone()
+                    if attempts == 1:
+                        try:
+                            barrier.wait(timeout=30)  # every agent has now seen the same budget
+                        except threading.BrokenBarrierError:
+                            pass  # an agent dropped out: the race goes on without the common start
+                    if spent + PRICE > limit:
+                        cur.execute("ROLLBACK")
+                        out[agent] = "declined"
+                        return
+                    cur.execute(f"UPDATE agent_budget SET spent = spent + {PRICE} WHERE id = 1")
+                    cur.execute("COMMIT")
+                    out[agent] = "approved"
+                    return
+                except Exception as e:
+                    try:
+                        cur.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    if getattr(e, "sqlstate", None) == "40001":
+                        retries[agent] = retries.get(agent, 0) + 1
+                        ctx.sleep(backoff_delay(attempts - 1, initial_backoff=0.05, max_backoff=0.5))
+                        continue
+                    out[agent] = f"error: {e}"
+                    return
+            out[agent] = f"gave up after {attempts} attempts"
+    finally:
+        conn.close()
+
+
+def _budget_race(isolation: str):
+    def act(ctx: Context, state: dict) -> dict:
+        ctx.run(f"UPSERT INTO agent_budget VALUES (1, {BUDGET}, 0)")
+        out: dict = {}
+        retries: dict = {}
+        barrier = threading.Barrier(AGENTS)
+        threads = [threading.Thread(target=_spend, args=(ctx, isolation, agent, barrier, out, retries,
+                                                        state.get("budget_gateway")))
+                   for agent in range(AGENTS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        spent, limit = ctx.query("SELECT spent, spend_limit FROM agent_budget WHERE id = 1", one=True)
+        approved = sum(v == "approved" for v in out.values())
+        declined = sum(v == "declined" for v in out.values())
+        result = {"Agents approved": f"{approved} of {AGENTS}", "Declined": declined,
+                  "Conflicts retried": sum(retries.values()), "Spent": f"${spent:,} of ${limit:,}",
+                  "Budget": "held ✓" if spent <= limit else f"OVERSPENT by ${spent - limit:,} ✗"}
+        if approved + declined < AGENTS:  # an agent that could not connect, gave up or hit another error
+            result["No outcome"] = AGENTS - approved - declined
+        return result
+    return act
+
+
+BUDGET_RACE = Scenario(
+    id="agent-budget", title="Agents race for one budget", tier=2, min_regions=1,
+    summary="Fifty agents spend from one $10,000 budget at the same instant. READ COMMITTED overspends it; "
+            "SERIALIZABLE holds it.",
+    prepare=_budget_prepare, reset=_drop("agent_budget"),
+    steps=(
+        Step("Race under READ COMMITTED", "One $10,000 budget. Fifty agents each spend $250, at the same instant.",
+             _budget_race("READ COMMITTED"), "Every agent sees money left, so every one of them spends"),
+        Step("Race under SERIALIZABLE", "Same race, SERIALIZABLE: agents that collide retry, and the budget holds",
+             _budget_race("SERIALIZABLE")),
+    ),
+)
+
+
 # -- 8. online schema change -----------------------------------------------------------------------------------
 
 def _schema(sql: str, label: str):
@@ -1174,4 +1298,5 @@ TIME_TRAVEL = Scenario(
 )
 
 
-ALL = [SURVIVE, SURVIVE_ZONE, STRETCH, ZONE_VS_REGION, ELASTIC, RBR, FOLLOWER, GLOBAL, DOMICILE, SKEW, SCHEMA, CDC, SPLIT, TIME_TRAVEL]
+ALL = [SURVIVE, SURVIVE_ZONE, STRETCH, ZONE_VS_REGION, ELASTIC, RBR, FOLLOWER, GLOBAL, DOMICILE, SKEW, BUDGET_RACE, SCHEMA, CDC, SPLIT,
+       TIME_TRAVEL]

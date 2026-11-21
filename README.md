@@ -241,6 +241,18 @@ with exponential backoff and jitter. Because `40003` and dropped connections can
 committed, every transfer writes its own UUID in the same transaction: a retry either applies it or hits the
 duplicate key and knows it already landed, so a transfer is never applied twice.
 
+The row that records a transfer's id is needed only while a retry of that transfer can still arrive, so those rows
+expire after an hour (`ttl_expire_after`). That parameter alone does not keep the table to an hour. Unless
+`ttl_job_cron` says otherwise, the job that deletes expired rows runs once a day; unless `ttl_delete_rate_limit` says
+otherwise, it may delete 100 rows a second on each node, which measured 291 rows a second over three regions against
+the 250 that Payments insert. Left to those defaults the table held a day of rows and its job could never catch up. So
+the job runs every ten minutes and may delete twice what Payments insert, a limit that is set again when the Payments
+rate changes. More is not better: at twice the insert rate the payments' rate did not move; at eight times, the
+deletes took a seventh of it on a busy laptop. Both Payments tables also keep ten minutes of old versions instead of
+CockroachDB's four hours (`gc.ttlseconds`): every payment overwrites two account rows and every expired transfer is
+deleted, and after six hours of payments 10,000 accounts were carrying 11 million old versions. Nothing reads the
+history of these two tables; the scenarios that look back in time have tables of their own.
+
 One more lesson baked in: while a range has lost quorum (for example a primary-region outage under ZONE survival),
 CockroachDB's `COMMIT` ignores `statement_timeout`, `transaction_timeout` and cancel requests. Each transfer attempt
 therefore has a 10-second client-side limit that closes the connection, after which the idempotent retry takes over. The stage shows money lost (always $0) and **recovery time**: from the failure to the first
@@ -254,15 +266,22 @@ Start one from the presenter console; the stage shows a guided card and you adva
 | Tier 1: resilience and multi-region | Tier 2: transactions and operations |
 |---|---|
 | Survive a region outage | Isolation levels: real write skew |
-| Stretch cluster: lose a whole cloud | Online schema change under load |
-| ZONE vs REGION survival | Changefeeds that survive failure |
-| Elastic scale | Split-brain test |
-| REGIONAL BY ROW (latency heatmap) | Time travel (undo an accidental DELETE) |
-| Follower reads | |
+| Stretch cluster: lose a whole cloud | Agents race for one budget |
+| ZONE vs REGION survival | Online schema change under load |
+| Elastic scale | Changefeeds that survive failure |
+| REGIONAL BY ROW (latency heatmap) | Split-brain test |
+| Follower reads | Time travel (undo an accidental DELETE) |
 | GLOBAL tables | |
 | Data domiciling | |
 
 Scenarios check their requirements (for example, 3 regions and latency on) and clean up their tables when you end them.
+
+**Agents race for one budget** is write skew at the scale agents work at. Fifty agents each read one $10,000 budget,
+decide that $250 more fits, and spend, all at the same instant. Under READ COMMITTED every check passes and the budget
+ends $2,500 overspent with no error raised; under SERIALIZABLE, CockroachDB's default, the agents that collide get a
+retryable error, retry, and the last ten are declined: exactly $10,000 is spent. Measured on the 9-node aws cluster:
+50 of 50 approved and $12,500 spent, then 40 approved, 10 declined and about 320 conflicts retried, each race in 5 to
+7 seconds. An agent here is a client that reads, decides and writes, as a tool-calling agent does; no model is involved.
 ZONE vs REGION survival needs 3 nodes in every region, because ZONE survival keeps each region's payments at home: the
 `residency` preset has them; on the 6-node presets, add one node per region first. It pauses cross-region transfers
 while ZONE survival is on: a transfer to a customer in the lost region waits for that region, and each Payments worker
@@ -304,8 +323,10 @@ for lost or duplicated messages. It uses its own `agent_demo` database. See [age
 ## Configuration (`.env`)
 
 See `.env.example`: `PRESET`, `CRDB_VERSION`, `PANEL_PORT`, `CHAOS_SUBNET` (if 10.77.0.0/16 collides with a VPN),
-`CRDB_LICENSE`/`CRDB_ORG`, `DOCKER_SOCKET`, and the optional `CONTROL_TOKEN` and `TRIGGER_TOKEN`. **Set a
-`CONTROL_TOKEN` whenever the panel is reachable from shared Wi-Fi.**
+`CRDB_LICENSE`/`CRDB_ORG`, `DOCKER_SOCKET`, and the optional `CONTROL_TOKEN`, `TRIGGER_TOKEN` and `REBUILD`. **Set a
+`CONTROL_TOKEN` whenever the panel is reachable from shared Wi-Fi.** `REBUILD=off` is for an instance whose cluster
+other people use: a rebuild wipes every database on it, so the API refuses one and the presenter does not offer it.
+Everything else stays open.
 
 **Set `CRDB_LICENSE` for anything longer than a week.** CockroachDB throttles a multi-node cluster without a license
 key to 5 open transactions 7 days after it was built, and the Payments workload then fails. Free and 30-day trial

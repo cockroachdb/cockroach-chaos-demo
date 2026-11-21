@@ -45,6 +45,8 @@ want a cloud-looking address in the browser bar, add a hosts-file entry such as
 1. 15-minute flow.
 2. **Follower reads** and **GLOBAL tables**: when to use which.
 3. **Isolation levels: write skew**: the classic bug READ COMMITTED allows and SERIALIZABLE prevents.
+   **Agents race for one budget** is the same bug with fifty agents and one $10,000 budget: $12,500 spent under
+   READ COMMITTED, exactly $10,000 under SERIALIZABLE. Use it when the audience is building agents.
 4. **Online schema change under load**: zero payment errors while a column and an index are added.
 5. **Changefeeds**: crash the node running the feed; it resumes from its checkpoint.
 6. **Split-brain test**: an isolated region refuses to commit alone; nothing diverges.
