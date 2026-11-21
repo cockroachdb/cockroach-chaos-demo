@@ -1,0 +1,103 @@
+<!doctype html>
+<!-- Artwork composited onto booth recordings: caption text, the scenario label, the fast-forward badge and the title
+     and end cards. render.mjs loads this page in Chrome with the app's own tokens and fonts inlined, calls
+     card(kind, data) and screenshots it with a transparent background. Frame: 1920x1080; band: the bottom 150 px. -->
+<html data-theme="__THEME__">
+<head>
+<meta charset="utf-8">
+<style>
+__TOKENS__
+html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: transparent; color: var(--fg); font-family: var(--font); }
+#root > div { position: absolute; }
+.caption { left: 310px; top: 930px; width: 1300px; height: 150px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-size: 42px; line-height: 1.24; font-weight: 400; letter-spacing: -.4px; text-align: center; white-space: nowrap; }
+.label { left: 40px; top: 930px; width: 262px; height: 150px; display: flex; flex-direction: column; justify-content: center; gap: 9px; }
+.label .eyebrow { font: 500 12px var(--mono); letter-spacing: 2.2px; text-transform: uppercase; color: var(--brand-text); }
+.label .title { font-size: 19px; line-height: 1.22; font-weight: 400; }
+.label .pips { display: flex; align-items: center; gap: 6px; font: 400 12px var(--mono); letter-spacing: 1.6px; text-transform: uppercase; color: var(--muted); }
+.label .pip { width: 16px; height: 4px; border-radius: 2px; background: var(--line); }
+.label .pip.done { background: var(--brand); }
+.label .pip.now { background: var(--fg); }
+.label .pips span { margin-left: 6px; }
+.badge { left: 1618px; top: 930px; width: 262px; height: 150px; display: flex; flex-direction: column; align-items: flex-end; justify-content: center; gap: 9px; }
+.badge .pill { font: 500 24px var(--mono); letter-spacing: 1px; padding: 7px 16px 8px; border-radius: 999px; color: var(--degraded);
+  border: 1.5px solid color-mix(in srgb, var(--degraded) 70%, transparent); }
+.badge .why { font: 400 12px var(--mono); letter-spacing: 2.2px; text-transform: uppercase; color: var(--muted); }
+.card { inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+  background: color-mix(in srgb, var(--bg) 90%, transparent); }
+.card .eyebrow { font: 500 17px var(--mono); letter-spacing: 4px; text-transform: uppercase; color: var(--brand-text); }
+.card h1 { margin: 0; font-size: 92px; line-height: 1.04; font-weight: 300; letter-spacing: -2.4px; max-width: 1500px; }
+.card .premise { margin-top: 30px; font-size: 36px; line-height: 1.3; font-weight: 300; color: var(--muted); max-width: 1300px; }
+.card .lines { margin-top: 34px; display: flex; flex-direction: column; gap: 16px; font-size: 46px; line-height: 1.2; font-weight: 300; letter-spacing: -.6px; max-width: 1500px; }
+.card .lines div::before { content: "✓"; color: var(--healthy-line); margin-right: 18px; font-weight: 400; }
+.card .foot { position: absolute; left: 0; right: 0; bottom: 64px; display: flex; flex-direction: column; align-items: center; gap: 22px; }
+.card .foot .note { font: 400 15px var(--mono); letter-spacing: 2.6px; text-transform: uppercase; color: var(--muted); }
+.card .foot img { height: 34px; display: block; }
+[data-theme=light] .card .foot img { filter: brightness(0); }
+/* The invitation on the end card: the QR code sits on its own white tile in both themes, so a phone reads it. */
+.card.end { padding-bottom: 96px; box-sizing: border-box; background: color-mix(in srgb, var(--bg) 96%, transparent); }
+.card .run { margin-top: 56px; display: flex; align-items: center; gap: 34px; text-align: left; }
+.card .run .qr { background: #fff; padding: 16px; border-radius: 14px; line-height: 0; border: 1px solid var(--line); }
+.card .run .qr img { width: 198px; height: 198px; display: block; image-rendering: pixelated; }
+.card .run .say { font-size: 38px; line-height: 1.2; font-weight: 400; letter-spacing: -.5px; }
+.card .run .url { margin-top: 12px; font: 400 21px var(--mono); letter-spacing: .4px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+const LOGO = '__LOGO__';
+const QR = '__QR__';
+const foot = (note) => { const f = el('div', 'foot'); const img = el('img'); img.src = LOGO; f.append(el('div', 'note', note), img); return f; };
+/** Draw one piece of artwork. -> the clip to screenshot. */
+window.card = async (kind, d) => {
+  const root = document.getElementById('root');
+  root.replaceChildren();
+  let clip = { x: 0, y: 930, width: 1920, height: 150 };
+  if (kind === 'caption') {
+    const box = el('div', 'caption');
+    box.append(...d.lines.map((l) => el('div', '', l)));
+    root.append(box);
+    for (let size = 42; size > 34 && Math.max(...[...box.children].map((c) => c.scrollWidth)) > 1300; size--) box.style.fontSize = `${size - 1}px`;
+  } else if (kind === 'label') {
+    const box = el('div', 'label');
+    box.append(el('div', 'title', d.title));
+    if (d.of) {
+      const pips = el('div', 'pips');
+      for (let i = 1; i <= d.of; i++) pips.append(el('div', `pip ${i < d.step ? 'done' : i === d.step ? 'now' : ''}`));
+      pips.append(el('span', '', `Step ${d.step} of ${d.of}`));
+      box.append(pips);
+    }
+    root.append(box);
+  } else if (kind === 'badge') {
+    const box = el('div', 'badge');
+    box.append(el('div', 'pill', `▶▶ ${d.text}`), el('div', 'why', 'Fast-forward'));
+    root.append(box);
+  } else if (kind === 'title') {
+    const box = el('div', 'card');
+    box.append(el('h1', '', d.title), el('div', 'premise', d.premise), foot(d.note));
+    root.append(box);
+    clip = { x: 0, y: 0, width: 1920, height: 1080 };
+  } else if (kind === 'end') {
+    const box = el('div', 'card end');
+    const lines = el('div', 'lines');
+    lines.append(...d.lines.map((l) => el('div', '', l)));
+    box.append(el('div', 'eyebrow', d.title), lines);
+    if (d.repo) {   // an invitation to run the same demo: QR code and the address in words
+      const run = el('div', 'run'); const tile = el('div', 'qr'); const img = el('img'); img.src = QR; tile.append(img);
+      const words = el('div'); words.append(el('div', 'say', 'Run this demo yourself'), el('div', 'url', d.repo));
+      run.append(tile, words); box.append(run);
+      await img.decode();
+    }
+    box.append(foot(d.note));
+    root.append(box);
+    clip = { x: 0, y: 0, width: 1920, height: 1080 };
+  }
+  await document.fonts.ready;
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  return clip;
+};
+</script>
+</body>
+</html>

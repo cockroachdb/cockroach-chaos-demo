@@ -227,7 +227,7 @@ def test_explainers_are_served_with_the_cluster_name(tmp_path):
     c = TestClient(app)
     chaos = c.get("/explainer/chaos").text
     assert "eastus" in chaos and "{{DISPLAY_NAME}}" not in chaos
-    has_continuum = (ROOT / "web" / "explainers" / "continuum.html").is_file()  # optional, kept out of public branches
+    has_continuum = (ROOT / "web" / "explainers" / "continuum.html").is_file()  # optional, kept out of the repository
     assert c.get("/explainer/continuum").status_code == (200 if has_continuum else 404)
     assert "playlist" in c.get("/explainer/playlist").text.lower()
     assert c.get("/explainer/nope").status_code == 404

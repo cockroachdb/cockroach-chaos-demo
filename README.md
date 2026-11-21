@@ -385,4 +385,6 @@ cluster back on the default preset.
     ./run.sh test                              # unit tests (creates .venv on first run)
     CHAOS_INTEGRATION=1 .venv/bin/pytest tests/integration -m integration -v   # uses and rebuilds the local cluster
 
+Design: [`docs/superpowers/specs/2026-10-09-chaos-control-plane-design.md`](docs/superpowers/specs/2026-10-09-chaos-control-plane-design.md)
+
 **Security note:** the cluster runs in insecure mode. For demos only.
