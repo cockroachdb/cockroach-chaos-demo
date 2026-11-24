@@ -65,7 +65,9 @@ const tokens = readFileSync(join(ROOT, 'web', 'shared', 'tokens.css'), 'utf8')
   .replace(/url\("\/static\/shared\/fonts\/([\w-]+\.woff2)"\)/g, (_, f) => `url("data:font/woff2;base64,${readFileSync(join(ROOT, 'web', 'shared', 'fonts', f)).toString('base64')}")`);
 const logo = `data:image/svg+xml;base64,${readFileSync(join(ROOT, 'web', 'shared', 'crl-logo.svg')).toString('base64')}`;
 // The end card invites the viewer to run the demo: the QR code (tools/booth/assets/repo-qr.svg) encodes https://REPO.
-const REPO = 'github.com/viragtripathi/cockroach-chaos-demo';
+// When REPO changes, make the file again, or test/end-card.test.mjs fails. With Python's segno:
+// segno.make('https://' + REPO, version=4).save('repo-qr.svg', border=0, xmldecl=False, nl=False)
+const REPO = 'github.com/cockroachdb/cockroach-chaos-demo';
 const qr = `data:image/svg+xml;base64,${readFileSync(join(HERE, 'assets', 'repo-qr.svg')).toString('base64')}`;
 const html = readFileSync(join(HERE, 'overlay.html'), 'utf8').replace('__THEME__', theme).replace('__TOKENS__', () => tokens).replace('__LOGO__', () => logo).replace('__QR__', () => qr);
 const { page, close } = await launch({ width: FRAME.w, height: FRAME.h });

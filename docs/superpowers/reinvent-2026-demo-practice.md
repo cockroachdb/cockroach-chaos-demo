@@ -106,7 +106,7 @@ knock on a database AWS sells.
   under ten seconds. That is the worst case on purpose. The client has to retry; each agent here does it in a short loop.
 - **"Is that a real cluster?"** Nine CockroachDB v26.4.1 nodes in containers on this laptop, the same binary as
   production, with network delay between the regions set from their real distances. It is on GitHub
-  (`viragtripathi/cockroach-chaos-demo`); anyone can run the same thing.
+  (`cockroachdb/cockroach-chaos-demo`); anyone can run the same thing.
 - **"Why did the node count change a few seconds late?"** The tile turns red when the process dies. The count changes
   when the cluster itself declares the node dead.
 
